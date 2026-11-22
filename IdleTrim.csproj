@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>idletrim</AssemblyName>
+    <RootNamespace>IdleTrim</RootNamespace>
+    <ApplicationIcon>src/app.ico</ApplicationIcon>
+    <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <NoWarn>SYSLIB0014</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="build/**;tests/**" />
+    <EmbeddedResource Include="src/prompts.txt" LogicalName="IdleTrim.prompts.txt" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.24.4" />
+  </ItemGroup>
+
+</Project>
