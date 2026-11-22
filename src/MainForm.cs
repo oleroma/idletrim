@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -36,11 +37,32 @@ namespace IdleTrim
         readonly Label sensitivityValue = Text0(), paddingValue = Text0(), learnInfo = Text0(), keptInfo = Text0();
         readonly Toggle learn = new Toggle("Learn from my edits") { Checked = true };
         readonly Btn forget = new Btn("Forget learning");
+        readonly Btn promptsButton = new Btn("Prompts");
+        readonly Btn resetEdits = new Btn("Reset edits") { Enabled = false };
+        readonly Stack<Tuple<sbyte[], HashSet<int>>> undo = new Stack<Tuple<sbyte[], HashSet<int>>>();
+        HashSet<int> splitBase;
+        readonly Session session = Session.Load();
+        Session restore;   // the closed session's video state, applied once that video is open again
+        // Asked before another video replaces one you're working on; tests swap it out.
+        internal Func<string, bool> ConfirmReplace;
+        readonly Btn play = new Btn("Play") { Enabled = false };
+        readonly Toggle playAll = new Toggle("Play cut parts too");
+        readonly Label hint = Text0();
+        readonly System.Windows.Forms.Timer playTimer = new System.Windows.Forms.Timer { Interval = 15 };
+        readonly System.Windows.Forms.Timer restartTimer = new System.Windows.Forms.Timer { Interval = 60 };
+        Player player;
+        bool playing;   // Play is on; player can be null for a moment while it restarts after a seek or an edit
+        Player warm;          // started at the playhead and waiting, so Play is instant
+        string warmKey;
+        readonly System.Windows.Forms.Timer warmTimer = new System.Windows.Forms.Timer { Interval = 120 };
 
         readonly Slider target = Bar(), res = Bar(), fps = Bar();
         readonly Label targetValue = Text0(), resValue = Text0(), fpsValue = Text0();
         readonly Toggle autoRes = new Toggle("Auto") { Checked = true };
         readonly Toggle mute = new Toggle("Remove audio");
+        readonly Toggle copy = new Toggle("No re-encode") { Checked = true };
+        readonly List<string> encoderIds = new List<string>();
+        bool hasNvenc;
         readonly Segmented encoder = new Segmented();
         readonly Label bitrate = Text0();
         readonly ProgressLine progress = new ProgressLine { Anchor = AnchorStyles.Left | AnchorStyles.Right, Height = Theme.S(6) };
@@ -57,13 +79,15 @@ namespace IdleTrim
         Learner learner;
         float[] scores;
         bool[] keep;
-        sbyte[] overrides;
+        sbyte[] overrides, dragBase;
+        HashSet<int> splits = new HashSet<int>();
         List<Segment> segments = new List<Segment>();
         Plan plan;
         CancelFlag cancel;
         bool updating;
         bool busy;
         double targetMB = 10;
+        bool targetAtMax = true;   // the target follows the most it can be (the source's quality) until you move it
         int manualShort, manualFps;
         readonly string startupFile;
 
@@ -115,7 +139,7 @@ namespace IdleTrim
             top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
             top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
             top.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            top.Controls.Add(preview, 0, 0);
+            top.Controls.Add(PreviewPanel(), 0, 0);
             top.Controls.Add(DetectionPanel(), 1, 0);
             grid.Controls.Add(top, 0, 1);
             grid.SetColumnSpan(top, 4);
@@ -125,7 +149,7 @@ namespace IdleTrim
             grid.SetColumnSpan(timeline, 4);
 
             // Output (same as cap-compress)
-            AddRow(grid, 3, "Target size", target, targetValue, null);
+            AddRow(grid, 3, "Target size", target, targetValue, copy);
             AddRow(grid, 4, "Resolution", res, resValue, autoRes);
             AddRow(grid, 5, "Frame rate", fps, fpsValue, null);
             var encLabel = Dim("Encoder");
@@ -163,22 +187,34 @@ namespace IdleTrim
                 grid.RowStyles.Add(i == 1 ? new RowStyle(SizeType.Percent, 100) : i == 9 ? new RowStyle(SizeType.Absolute, S(28)) : new RowStyle(SizeType.AutoSize));
             grid.RowCount = 11;
 
-            AcceptButton = export;
-
             EventHandler changed = (o, e) => { if (!updating) Recalculate(); };
-            target.Scroll += (o, e) => { targetMB = target.Value / 10.0; Recalculate(); };
+            target.Scroll += (o, e) => { targetMB = target.Value / 10.0; targetAtMax = target.Value >= target.Maximum; Recalculate(); };
+            copy.CheckedChanged += changed;
             res.Scroll += (o, e) => { manualShort = plan.Rungs[res.Value]; Recalculate(); };
             fps.Scroll += (o, e) => { manualFps = fps.Value; Recalculate(); };
             autoRes.CheckedChanged += (o, e) => { if (plan != null) manualShort = plan.Short; changed(o, e); };
-            mute.CheckedChanged += changed;
+            mute.CheckedChanged += (o, e) => { changed(o, e); RestartPlayback(); ScheduleWarm(); };
             encoder.SelectedIndexChanged += changed;
 
             model.SelectedIndexChanged += (o, e) => { if (!updating) Rescore(); };
             sensitivity.Scroll += (o, e) => Rescore();
             padding.Scroll += (o, e) => Rescore();
-            timeline.PlayheadChanged += (o, e) => ShowPlayhead();
-            timeline.ToggleRequested += Toggle;
+            timeline.PlayheadChanged += (o, e) => { ShowPlayhead(); RestartPlayback(); ScheduleWarm(); };
+            timeline.RemoveRequested += RemovePart;
+            timeline.RangeDragged += DragRange;
+            timeline.UndoRequested += Undo;
+            resetEdits.Click += (o, e) => ResetEdits();
+            timeline.PlayRequested += PlayPause;
+            timeline.SplitRequested += Split;
+            timeline.RangeRequested += SetRange;
+            timeline.EdgeDragged += DragEdge;
+            play.Click += (o, e) => { PlayPause(); timeline.Focus(); };
+            playAll.CheckedChanged += (o, e) => { RestartPlayback(); ScheduleWarm(); };
+            playTimer.Tick += (o, e) => PlayTick();
+            restartTimer.Tick += (o, e) => { if (timeline.Scrubbing) return; restartTimer.Stop(); if (playing) StartPlayback(); };
+            warmTimer.Tick += (o, e) => { warmTimer.Stop(); Warm(); };
             forget.Click += (o, e) => ForgetLearning();
+            promptsButton.Click += (o, e) => EditPrompts();
 
             browse.Click += (o, e) => Browse();
             export.Click += (o, e) => StartExport();
@@ -186,9 +222,111 @@ namespace IdleTrim
             showFile.Click += (o, e) => { if (lastOutput != null) Process.Start("explorer.exe", "/select,\"" + lastOutput + "\""); };
             AcceptDrops(this);
             Shown += (o, e) => { Retrain(); InitTools(); };
-            FormClosing += (o, e) => { if (cancel != null) cancel.Cancel(); };
+            FormClosing += (o, e) => { StopPlayback(); DropWarm(); SaveSession(); if (cancel != null) cancel.Cancel(); };
+            ConfirmReplace = AskReplace;
+
+            // Carry on where the last session left off.
+            updating = true;
+            model.SelectedIndex = Math.Max(0, Math.Min(2, session.Model));
+            sensitivity.Value = Math.Max(0, Math.Min(100, session.Sensitivity));
+            padding.Value = Math.Max(0, Math.Min(40, session.Padding));
+            learn.Checked = session.Learn;
+            playAll.Checked = session.PlayAll;
+            updating = false;
 
             SetInputs();
+        }
+
+        // ---- session ----
+
+        void SaveEdits()
+        {
+            if (analysis == null || overrides == null) return;
+            try { Edits.Save(analysis.Key, overrides, splits); } catch (Exception) { }
+        }
+
+        void SaveSession()
+        {
+            SaveEdits();
+            session.Model = model.SelectedIndex;
+            session.Sensitivity = sensitivity.Value;
+            session.Padding = padding.Value;
+            session.Learn = learn.Checked;
+            session.PlayAll = playAll.Checked;
+            if (video != null && analysis != null)
+            {
+                session.Video = video.Path;
+                session.Playhead = timeline.Playhead;
+                session.ViewStart = timeline.ViewStart;
+                session.ViewLength = timeline.Zoomed ? timeline.ViewLength : 0;
+                session.Encoder = EncoderId.StartsWith("original:") ? "original" : EncoderId;
+                session.Mute = mute.Checked;
+                session.Copy = copy.Checked;
+                session.TargetAtMax = targetAtMax;
+                session.TargetMB = targetMB;
+                session.AutoRes = autoRes.Checked;
+                session.Short = manualShort;
+                session.Fps = manualFps;
+            }
+            try { session.Save(); } catch (Exception) { }
+        }
+
+        // The output settings the closed session had for this video.
+        void RestoreOutput(Session r)
+        {
+            updating = true;
+            autoRes.Checked = r.AutoRes;
+            mute.Checked = r.Mute && video.HasAudio;
+            copy.Checked = r.Copy;
+            int index = encoderIds.FindIndex(id => id == r.Encoder || (r.Encoder == "original" && id.StartsWith("original:")));
+            if (index >= 0) encoder.SelectedIndex = index;
+            updating = false;
+            targetAtMax = r.TargetAtMax;
+            targetMB = r.TargetMB;
+            if (r.Short > 0) manualShort = r.Short;
+            if (r.Fps > 0) manualFps = r.Fps;
+        }
+
+        bool AskReplace(string path)
+        {
+            using (var d = new ThemedDialog("Open another video", new string[,]
+            {
+                { null, "Open " + Path.GetFileName(path) + "?" },
+                { null, "Your edits to " + Path.GetFileName(video.Path) + " are saved and come back when you open it again." }
+            }, "Open", "Cancel", "Don't ask again"))
+            {
+                if (d.ShowDialog(this) != DialogResult.OK) return false;
+                if (d.Option.Checked) session.AskBeforeReplacing = false;
+                return true;
+            }
+        }
+
+        Control PreviewPanel()
+        {
+            var p = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 2, Margin = new Padding(0, 0, S(14), 0) };
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            p.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            p.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            preview.Margin = new Padding(0, 0, 0, S(8));
+            p.Controls.Add(preview, 0, 0);
+            p.SetColumnSpan(preview, 3);
+            play.Anchor = AnchorStyles.Left;
+            play.MinimumSize = new Size(S(84), 0);
+            p.Controls.Add(play, 0, 1);
+            playAll.Anchor = AnchorStyles.Left;
+            playAll.Margin = new Padding(S(12), 0, 0, 0);
+            p.Controls.Add(playAll, 1, 1);
+            hint.Text = "Drag band to add · right-click removes · Ctrl+Z undo";
+            hint.ForeColor = Theme.Faint;
+            hint.AutoEllipsis = true;
+            hint.AutoSize = false;
+            hint.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+            hint.Height = S(20);
+            hint.TextAlign = ContentAlignment.MiddleRight;
+            p.Controls.Add(hint, 2, 1);
+            return p;
         }
 
         Control DetectionPanel()
@@ -230,9 +368,15 @@ namespace IdleTrim
             learnInfo.Margin = new Padding(0, S(2), 0, S(6));
             p.Controls.Add(learnInfo, 0, 4);
             p.SetColumnSpan(learnInfo, 3);
-            forget.Anchor = AnchorStyles.Left;
-            p.Controls.Add(forget, 0, 5);
-            p.SetColumnSpan(forget, 3);
+            var row = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0), WrapContents = false };
+            promptsButton.Margin = new Padding(0, 0, S(8), 0);
+            row.Controls.Add(promptsButton);
+            forget.Margin = new Padding(0);
+            row.Controls.Add(forget);
+            resetEdits.Margin = new Padding(S(8), 0, 0, 0);
+            row.Controls.Add(resetEdits);
+            p.Controls.Add(row, 0, 5);
+            p.SetColumnSpan(row, 3);
 
             keptInfo.Font = new Font("Segoe UI Semibold", 10f);
             keptInfo.Margin = new Padding(0, S(12), 0, 0);
@@ -353,14 +497,39 @@ namespace IdleTrim
 
         void ToolsReady()
         {
-            updating = true;
-            encoder.Items.Clear();
-            encoder.Items.Add("x264 · best quality");
-            if (Engine.HasEncoder(ffmpeg, "h264_nvenc")) encoder.Items.Add("NVENC · fast");
-            encoder.SelectedIndex = 0;
-            updating = false;
+            hasNvenc = Engine.HasEncoder(ffmpeg, "h264_nvenc");
+            FillEncoders();
             status.Text = "Ready.";
             if (startupFile != null) LoadVideo(startupFile);
+            else if (!string.IsNullOrEmpty(session.Video) && File.Exists(session.Video)) { restore = session; LoadVideo(session.Video); }
+        }
+
+        // x264 and NVENC write H.264 MP4; Original keeps the source's codec and container.
+        void FillEncoders()
+        {
+            string was = encoder.SelectedIndex >= 0 && encoder.SelectedIndex < encoderIds.Count ? encoderIds[encoder.SelectedIndex] : null;
+            updating = true;
+            encoder.Items.Clear();
+            encoderIds.Clear();
+            encoder.Items.Add("x264 · best quality");
+            encoderIds.Add("libx264");
+            if (hasNvenc) { encoder.Items.Add("NVENC · fast"); encoderIds.Add("h264_nvenc"); }
+            string original = video == null ? null : Engine.OriginalEncoder(ffmpeg, video);
+            if (original != null)
+            {
+                encoder.Items.Add("Original · " + Engine.CodecName(video.VideoCodec) + " " + OriginalExt(video).TrimStart('.').ToUpperInvariant());
+                encoderIds.Add("original:" + original);
+            }
+            int index = was == null ? -1 : encoderIds.FindIndex(id => id == was || (id.StartsWith("original:") && was.StartsWith("original:")));
+            encoder.SelectedIndex = Math.Max(0, index);
+            updating = false;
+        }
+
+        // The source's container when it can hold the codec; otherwise MKV.
+        static string OriginalExt(VideoInfo v)
+        {
+            string e = v.Ext;
+            return e == ".mp4" || e == ".mkv" || e == ".mov" || e == ".m4v" ? e : ".mkv";
         }
 
         // ---- learning ----
@@ -385,8 +554,85 @@ namespace IdleTrim
                 learnInfo.Text = string.Format("Learned from {0} video{1} ({2} of action, {3} idle). Both models use what they learned.",
                     learner.Videos, learner.Videos == 1 ? "" : "s", Time(learner.Kept * Analysis.Step), Time(learner.Cut * Analysis.Step));
             else
-                learnInfo.Text = "Not trained yet: SigLIP 2 judges frames with text prompts and DINOv2 uses motion. Fix the timeline and export a few videos to teach both.";
+                learnInfo.Text = string.Format("Not trained yet: SigLIP 2 judges frames with {0}, and DINOv2 learns from SigLIP's surest frames. Fix the timeline and export a few videos to teach both.",
+                    PromptSet.Current.Custom ? "your prompts" : "the built-in prompts");
             forget.Enabled = !busy && learner.Videos > 0;
+        }
+
+        // ---- prompts ----
+
+        void EditPrompts()
+        {
+            if (busy) return;
+            StopPlayback();
+            using (var d = new PromptsDialog(PromptSet.Current, learner != null && learner.Trained))
+            {
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+                ApplyPrompts(d.Action, d.Idle, null);
+            }
+        }
+
+        // Embeds only the prompts that are new, then rescores from the cached frames: no re-analysis needed.
+        void ApplyPrompts(List<string> action, List<string> idle, Action<string> done)
+        {
+            var builtIn = PromptSet.BuiltIn();
+            Action<string> finish = error =>
+            {
+                if (error == null) status.Text = PromptSet.Current.Custom ? "Using your prompts." : "Using the built-in prompts.";
+                UpdateLearnInfo();
+                Rescore();
+                if (done != null) done(error);
+            };
+            if (action.SequenceEqual(builtIn.Action) && idle.SequenceEqual(builtIn.Idle)) { PromptSet.Reset(); finish(null); return; }
+
+            var known = new Dictionary<string, float[]>();
+            foreach (var set in new[] { builtIn, PromptSet.Current })
+            {
+                for (int i = 0; i < set.Action.Count; i++) known[set.Action[i]] = set.ActionEmb[i];
+                for (int i = 0; i < set.Idle.Count; i++) known[set.Idle[i]] = set.IdleEmb[i];
+            }
+            var missing = action.Concat(idle).Where(t => !known.ContainsKey(t)).Distinct().ToList();
+            Action save = () =>
+            {
+                var set = new PromptSet();
+                foreach (var t in action) { set.Action.Add(t); set.ActionEmb.Add(known[t]); }
+                foreach (var t in idle) { set.Idle.Add(t); set.IdleEmb.Add(known[t]); }
+                PromptSet.Save(set);
+            };
+            if (missing.Count == 0) { save(); finish(null); return; }
+
+            if (!TextEncoder.Present())
+            {
+                bool download = ThemedDialog.Ask(this, "Text model needed", new string[,]
+                {
+                    { null, "New prompts are read by SigLIP 2's text half, which IdleTrim only needs while you edit them." },
+                    { "Size", "about 600 MB, from Hugging Face" },
+                    { null, "Download it into the models folder next to this app?" }
+                }, "Download", "Not now");
+                if (!download) { status.Text = "Prompts not changed: the text model is needed to read new ones."; if (done != null) done("no text model"); return; }
+                RunBusy("Downloading the text model", (flag, report) => TextEncoder.Download((pct, name) => report(pct / 100.0, "Downloading " + name), flag), error =>
+                {
+                    if (error != null) { status.Text = "Couldn't download the text model: " + error; if (done != null) done(error); return; }
+                    ApplyPrompts(action, idle, done);
+                });
+                return;
+            }
+
+            RunBusy("Reading the prompts", (flag, report) =>
+            {
+                report(0, "Loading the text model");
+                using (var enc = new TextEncoder())
+                {
+                    var embs = enc.Embed(missing);
+                    for (int i = 0; i < missing.Count; i++) known[missing[i]] = embs[i];
+                }
+                save();
+            }, error =>
+            {
+                if (error != null) status.Text = "Couldn't read the prompts: " + error;
+                progress.Value = 0;
+                finish(error);
+            });
         }
 
         void ForgetLearning()
@@ -411,6 +657,12 @@ namespace IdleTrim
         void LoadVideo(string path)
         {
             if (busy || ffprobe == null) return;
+            bool another = video != null && analysis != null && !string.Equals(Path.GetFullPath(path), Path.GetFullPath(video.Path), StringComparison.OrdinalIgnoreCase);
+            if (another && session.AskBeforeReplacing && !ConfirmReplace(path)) return;
+            StopPlayback();
+            DropWarm();
+            SaveEdits();
+            if (restore != null && !string.Equals(restore.Video, path, StringComparison.OrdinalIgnoreCase)) restore = null;
             try
             {
                 video = Engine.Probe(ffprobe, path);
@@ -434,6 +686,9 @@ namespace IdleTrim
             manualShort = video.ShortSide;
             manualFps = Math.Min(24, video.MaxFps);
             targetMB = 10;
+            targetAtMax = true;
+            FillEncoders();
+            if (restore != null) RestoreOutput(restore);
             showFile.Visible = false;
             SetAnalysis(null);
 
@@ -487,8 +742,21 @@ namespace IdleTrim
         {
             analysis = a;
             overrides = a == null ? null : new sbyte[a.Count];
+            splits = new HashSet<int>();
+            undo.Clear();
+            sbyte[] savedOverrides;
+            HashSet<int> savedSplits;
+            if (a != null && Edits.Load(a.Key, a.Count, out savedOverrides, out savedSplits)) { overrides = savedOverrides; splits = savedSplits; }
             timeline.SetAnalysis(a);
             Rescore();
+            if (a != null && restore != null)
+            {
+                timeline.Playhead = Math.Min(restore.Playhead, a.Duration);
+                if (restore.ViewLength > 0) timeline.SetView(restore.ViewStart, restore.ViewLength);
+                ShowPlayhead();
+                ScheduleWarm();
+                restore = null;
+            }
         }
 
         // ---- detection ----
@@ -505,7 +773,7 @@ namespace IdleTrim
                 scores = null;
                 keep = null;
                 segments = new List<Segment>();
-                timeline.SetResult(null, null, null, Threshold);
+                timeline.SetResult(null, null, null, null, Threshold);
                 keptInfo.Text = "";
                 ShowPlayhead();
                 Recalculate();
@@ -515,33 +783,254 @@ namespace IdleTrim
             scores = Scoring.Scores(analysis, source, learner);
             keep = Scoring.Mask(scores, Threshold, PadSeconds, overrides);
             segments = Scoring.Segments(keep, analysis.Duration);
-            timeline.SetResult(scores, keep, overrides, Threshold);
+            timeline.SetResult(scores, keep, overrides, splits, Threshold);
             double kept = Segment.Total(segments);
             keptInfo.Text = segments.Count == 0
                 ? "Nothing kept. Raise the sensitivity or click the band under the graph."
                 : string.Format("Keeps {0} of {1} in {2} part{3}", Time(kept), Time(analysis.Duration), segments.Count, segments.Count == 1 ? "" : "s");
-            ShowPlayhead();
+            if (!playing || player == null) ShowPlayhead();
             Recalculate();
+            RestartPlayback();
+            ScheduleWarm();
         }
 
-        // Click a part to flip it; click a part you flipped to hand it back to detection.
-        void Toggle(int step)
+        // ---- editing; every change can be undone with Ctrl+Z ----
+
+        void PushUndo()
         {
-            if (analysis == null || keep == null || busy) return;
-            if (overrides[step] != 0)
+            undo.Push(Tuple.Create((sbyte[])overrides.Clone(), new HashSet<int>(splits)));
+            if (undo.Count > 100)
             {
-                sbyte was = overrides[step];
-                for (int i = step; i >= 0 && overrides[i] == was; i--) overrides[i] = 0;
-                for (int i = step + 1; i < overrides.Length && overrides[i] == was; i++) overrides[i] = 0;
+                var keepLast = undo.Take(100).Reverse().ToList();
+                undo.Clear();
+                foreach (var u in keepLast) undo.Push(u);
+            }
+        }
+
+        void Undo()
+        {
+            if (analysis == null || busy || undo.Count == 0) return;
+            var u = undo.Pop();
+            overrides = u.Item1;
+            splits = u.Item2;
+            Rescore();
+        }
+
+        // Back to exactly what detection chose.
+        void ResetEdits()
+        {
+            if (analysis == null || busy || (overrides.All(o => o == 0) && splits.Count == 0)) return;
+            PushUndo();
+            overrides = new sbyte[analysis.Count];
+            splits = new HashSet<int>();
+            Rescore();
+        }
+
+        // Right-click or Delete: the whole part under the step is cut.
+        void RemovePart(int step)
+        {
+            if (analysis == null || keep == null || busy || !keep[step]) return;
+            PushUndo();
+            int start, end;
+            Scoring.RunAt(keep, step, splits, out start, out end);
+            for (int i = start; i <= end; i++) overrides[i] = -1;
+            Rescore();
+        }
+
+        // Dragging across the band: kept (left button) or cut (right) from where the drag began to the pointer.
+        // A kept range swallows the splits it covers or touches, so it merges with the parts next to it.
+        void DragRange(int start, int end, bool keepIt, bool begin)
+        {
+            if (analysis == null || busy) return;
+            if (begin || dragBase == null)
+            {
+                PushUndo();
+                dragBase = (sbyte[])overrides.Clone();
+                splitBase = new HashSet<int>(splits);
+            }
+            Array.Copy(dragBase, overrides, overrides.Length);
+            splits = new HashSet<int>(splitBase);
+            start = Math.Max(0, start);
+            end = Math.Min(end, overrides.Length);
+            for (int i = start; i < end; i++) overrides[i] = keepIt ? (sbyte)1 : (sbyte)-1;
+            if (keepIt) splits.RemoveWhere(sp => sp >= start && sp <= end);
+            Rescore();
+        }
+
+        // S: a part splits in two at the playhead, so each half can be removed on its own. Again on a split removes it.
+        void Split(int step)
+        {
+            if (analysis == null || busy || step <= 0 || step >= analysis.Count) return;
+            PushUndo();
+            if (!splits.Remove(step)) splits.Add(step);
+            Rescore();
+        }
+
+        // I/O then K or X: keep or cut exactly the marked steps.
+        void SetRange(int start, int end, bool keepIt)
+        {
+            if (analysis == null || busy) return;
+            PushUndo();
+            for (int i = Math.Max(0, start); i < Math.Min(end, overrides.Length); i++) overrides[i] = keepIt ? (sbyte)1 : (sbyte)-1;
+            if (keepIt) splits.RemoveWhere(sp => sp >= start && sp <= end);
+            Rescore();
+        }
+
+        // Moving the edge at `boundary` to `to` gives the steps it passes over to the side that grows.
+        void DragEdge(int boundary, int to, bool leftKept, bool begin)
+        {
+            if (analysis == null || busy) return;
+            if (begin || dragBase == null) { PushUndo(); dragBase = (sbyte[])overrides.Clone(); }
+            Array.Copy(dragBase, overrides, overrides.Length);
+            sbyte left = leftKept ? (sbyte)1 : (sbyte)-1;
+            if (to > boundary) for (int i = boundary; i < to; i++) overrides[i] = left;
+            else for (int i = to; i < boundary; i++) overrides[i] = (sbyte)-left;
+            Rescore();
+        }
+
+        // ---- playback ----
+
+        void PlayPause()
+        {
+            if (playing) { PausePlayback(); return; }
+            if (analysis == null || video == null || busy) return;
+            StartPlayback();
+        }
+
+        // The parts to play from the playhead on: the kept parts, or everything with Play cut parts too.
+        List<Segment> PlayParts(double from)
+        {
+            var list = new List<Segment>();
+            if (playAll.Checked)
+            {
+                if (from < analysis.Duration - 0.1) list.Add(new Segment(from, analysis.Duration));
+                return list;
+            }
+            foreach (var seg in segments)
+                if (seg.End > from + 0.05) list.Add(new Segment(Math.Max(seg.Start, from), seg.End));
+            return list;
+        }
+
+        // What a player started now would play; a warm player is used only if this hasn't changed.
+        string PlayKey()
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendFormat(CultureInfo.InvariantCulture, "{0}|{1:0.###}|{2}|{3}", video.Path, timeline.Playhead, playAll.Checked, mute.Checked);
+            foreach (var seg in segments) sb.AppendFormat(CultureInfo.InvariantCulture, "|{0:0.###}-{1:0.###}", seg.Start, seg.End);
+            return sb.ToString();
+        }
+
+        void ScheduleWarm()
+        {
+            if (playing || analysis == null || ffmpeg == null) return;
+            warmTimer.Stop();
+            warmTimer.Start();
+        }
+
+        void Warm()
+        {
+            if (playing || busy || analysis == null || video == null || ffmpeg == null) return;
+            string key = PlayKey();
+            if (warm != null && warmKey == key) return;
+            DropWarm();
+            var parts = PlayParts(timeline.Playhead);
+            if (parts.Count == 0) return;
+            warm = new Player(ffmpeg, video, parts, !mute.Checked, false);
+            warm.Start();
+            warmKey = key;
+        }
+
+        void DropWarm()
+        {
+            warmTimer.Stop();
+            if (warm != null) { warm.Dispose(); warm = null; }
+            warmKey = null;
+        }
+
+        void StartPlayback()
+        {
+            DisposePlayer();
+            if (warm != null && warmKey == PlayKey())
+            {
+                player = warm;
+                warm = null;
+                warmKey = null;
+                player.Arm();
             }
             else
             {
-                int start, end;
-                Scoring.RunAt(keep, step, out start, out end);
-                sbyte value = keep[step] ? (sbyte)-1 : (sbyte)1;
-                for (int i = start; i <= end; i++) overrides[i] = value;
+                DropWarm();
+                var parts = PlayParts(timeline.Playhead);
+                if (parts.Count == 0) { timeline.Playhead = 0; parts = PlayParts(0); }
+                if (parts.Count == 0) { status.Text = "Nothing kept to play."; playing = false; play.Text = "Play"; return; }
+                player = new Player(ffmpeg, video, parts, !mute.Checked);
+                player.Start();
             }
-            Rescore();
+            playing = true;
+            play.Text = "Pause";
+            playTimer.Start();
+        }
+
+        void PlayTick()
+        {
+            if (player == null) { if (!playing) playTimer.Stop(); return; }
+            var f = player.Next();
+            if (f != null)
+            {
+                preview.ShowFrame(f.Bgr, Player.W, Player.H);
+                player.Recycle(f);
+                timeline.Playhead = f.Source;
+                int step = analysis.StepAt(f.Source);
+                preview.Kept = keep == null || keep[step];
+                preview.Badge = keep == null ? null : keep[step] ? "KEPT" : "CUT";
+                preview.Caption = string.Format("{0} / {1}", Time(f.Source), Time(analysis.Duration));
+            }
+            if (player.Finished) StopPlayback();
+        }
+
+        // Scrubbing or editing while playing: the old player stops at once, so it can't pull the playhead back, the
+        // frame at the new spot shows, and playback carries on from there as soon as the drag rests.
+        void RestartPlayback()
+        {
+            if (!playing) return;
+            DisposePlayer();
+            ShowPlayhead();
+            restartTimer.Stop();
+            restartTimer.Start();
+        }
+
+        void DisposePlayer()
+        {
+            if (player != null) { player.Dispose(); player = null; }
+        }
+
+        // Pause keeps the player and its frame on screen; it waits as the warm player, so Play resumes instantly.
+        void PausePlayback()
+        {
+            restartTimer.Stop();
+            playTimer.Stop();
+            playing = false;
+            play.Text = "Play";
+            if (player == null) { ShowPlayhead(); ScheduleWarm(); SetInputs(); return; }
+            DropWarm();
+            player.Pause();
+            warm = player;
+            player = null;
+            warmKey = PlayKey();
+            play.Text = "Play";
+            SetInputs();
+        }
+
+        void StopPlayback()
+        {
+            restartTimer.Stop();
+            playTimer.Stop();
+            bool was = playing;
+            playing = false;
+            DisposePlayer();
+            play.Text = "Play";
+            if (was) ShowPlayhead();
+            ScheduleWarm();
         }
 
         void ShowPlayhead()
@@ -566,16 +1055,25 @@ namespace IdleTrim
                 AutoFps = false,
                 Short = manualShort,
                 Fps = manualFps,
-                Nvenc = encoder.SelectedIndex == 1,
+                Encoder = EncoderId.StartsWith("original:") ? EncoderId.Substring(9) : EncoderId,
+                Ext = CopyOn || EncoderId.StartsWith("original:") ? OriginalExt(video) : ".mp4",
+                Copy = CopyOn,
                 Mute = mute.Checked
             };
         }
+
+        string EncoderId { get { return encoder.SelectedIndex >= 0 && encoder.SelectedIndex < encoderIds.Count ? encoderIds[encoder.SelectedIndex] : "libx264"; } }
+
+        // Copying applies only at the top of the target range, where nothing has to shrink.
+        bool CopyOn { get { return copy.Checked && targetAtMax; } }
 
         // Rebuilds the plan and pushes its limits back into every control.
         void Recalculate()
         {
             if (video == null || segments.Count == 0) { plan = null; ClearOutputText(); SetInputs(); return; }
-            plan = Engine.MakePlan(video, ReadSettings());
+            var settings = ReadSettings();
+            if (targetAtMax) settings.TargetMB = double.MaxValue;
+            plan = Engine.MakePlan(video, settings);
             manualShort = plan.Short;
             manualFps = plan.Fps;
 
@@ -592,12 +1090,26 @@ namespace IdleTrim
             fps.Value = plan.Fps;
             updating = false;
 
-            targetValue.Text = plan.CanReduce ? string.Format("{0:0.0} MB (max {1:0.0})", plan.TargetMB, plan.MaxMB) : "not possible";
-            resValue.Text = string.Format("{0}x{1}  (max {2}p)", plan.OutLong, plan.Short, plan.ResCap);
-            fpsValue.Text = string.Format("{0} fps  (max {1})", plan.Fps, plan.FpsCap);
-            bitrate.Text = plan.AudioKbps > 0
-                ? string.Format("Video {0} kbps, audio {1} kbps", plan.VideoKbps, plan.AudioKbps)
-                : string.Format("Video {0} kbps, no audio", plan.VideoKbps);
+            if (CopyOn)
+            {
+                targetValue.Text = string.Format("about {0:0.0} MB (max)", video.SizeBytes * plan.Kept / video.Duration / 1048576.0);
+                updating = true;
+                res.Value = res.Maximum;
+                fps.Value = fps.Maximum;
+                updating = false;
+                resValue.Text = string.Format("{0}x{1}  (source)", video.Width, video.Height);
+                fpsValue.Text = string.Format("{0:0.##} fps  (source)", video.Fps);
+                bitrate.Text = "Copied as is, no quality loss. Each part starts at the keyframe before its cut, so it may start a moment early.";
+            }
+            else
+            {
+                targetValue.Text = plan.CanReduce ? string.Format(targetAtMax ? "{0:0.0} MB (max)" : "{0:0.0} MB (max {1:0.0})", plan.TargetMB, plan.MaxMB) : "not possible";
+                resValue.Text = string.Format("{0}x{1}  (max {2}p)", plan.OutLong, plan.Short, plan.ResCap);
+                fpsValue.Text = string.Format("{0} fps  (max {1})", plan.Fps, plan.FpsCap);
+                bitrate.Text = plan.AudioKbps > 0
+                    ? string.Format("Video {0} kbps, audio {1} kbps", plan.VideoKbps, plan.AudioKbps)
+                    : string.Format("Video {0} kbps, no audio", plan.VideoKbps);
+            }
             SetInputs();
         }
 
@@ -610,18 +1122,23 @@ namespace IdleTrim
         {
             bool loaded = video != null && !busy;
             bool ready = loaded && analysis != null;
-            bool canExport = ready && plan != null && plan.CanReduce && segments.Count > 0;
+            bool canExport = ready && plan != null && (plan.CanReduce || CopyOn) && segments.Count > 0;
+            bool encode = canExport && !CopyOn;
             browse.Enabled = !busy;
+            play.Enabled = ready && segments.Count > 0 || playing;
             model.Enabled = sensitivity.Enabled = padding.Enabled = ready;
             timeline.Enabled = ready;
             learn.Enabled = !busy;
             forget.Enabled = !busy && learner != null && learner.Videos > 0;
-            target.Enabled = canExport;
-            autoRes.Enabled = canExport;
-            res.Enabled = canExport && !autoRes.Checked && plan.Rungs.Count > 1;
-            fps.Enabled = canExport && video.MaxFps > plan.MinFps;
+            promptsButton.Enabled = !busy;
+            resetEdits.Enabled = ready && overrides != null && (overrides.Any(o => o != 0) || splits.Count > 0);
+            target.Enabled = canExport && plan.CanReduce;
+            copy.Enabled = canExport && targetAtMax;
+            autoRes.Enabled = encode;
+            res.Enabled = encode && !autoRes.Checked && plan.Rungs.Count > 1;
+            fps.Enabled = encode && video.MaxFps > plan.MinFps;
             mute.Enabled = loaded && video.HasAudio;
-            encoder.Enabled = loaded;
+            encoder.Enabled = loaded && !CopyOn;
             export.Enabled = canExport;
             cancelButton.Enabled = busy;
         }
@@ -634,14 +1151,17 @@ namespace IdleTrim
 
         void StartExport()
         {
-            if (video == null || analysis == null || plan == null || !plan.CanReduce || segments.Count == 0 || busy) return;
+            if (video == null || analysis == null || plan == null || !(plan.CanReduce || CopyOn) || segments.Count == 0 || busy) return;
+            StopPlayback();
+            DropWarm();
+            SaveEdits();
             var settings = ReadSettings();
             var runPlan = plan;
             var source = video;
             var learned = analysis;
             var choice = (bool[])keep.Clone();
             bool teach = learn.Checked;
-            string output = Engine.OutputPath(source.Path);
+            string output = Engine.OutputPath(source.Path, settings.Ext);
             string tool = ffmpeg;
             long size = 0;
             showFile.Visible = false;

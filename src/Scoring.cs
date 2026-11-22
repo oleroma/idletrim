@@ -81,7 +81,7 @@ namespace IdleTrim
         }
 
         // Class-balanced logistic regression, full-batch gradient descent with Adam and a little L2.
-        static float[] Fit(List<float[]> x, List<bool> y, out float bias)
+        internal static float[] Fit(List<float[]> x, List<bool> y, out float bias)
         {
             int n = x.Count, d = x[0].Length;
             int pos = y.Count(v => v);
@@ -129,7 +129,8 @@ namespace IdleTrim
 
     public static class Scoring
     {
-        // 0..1 per step, higher is more action. Untrained: SigLIP prompts / motion, scaled to the video's own range.
+        // 0..1 per step, higher is more action. Untrained: SigLIP compares frames with the prompts, and DINOv2 learns
+        // from SigLIP's surest frames in this video. Both are scaled to the video's own range.
         public static float[] Scores(Analysis a, Source source, Learner learner)
         {
             bool trained = learner != null && learner.Trained;
@@ -144,16 +145,61 @@ namespace IdleTrim
             }
             else
             {
-                sig = Spread(a.ZeroShot);
-                var motion = Spread(a.Motion);
-                // DINOv2 has no prompts: until it has learned, it stands in with motion.
-                for (int i = 0; i < a.Count; i++) dn[i] = motion[i];
-                for (int i = 0; i < a.Count; i++) sig[i] = 0.8f * sig[i] + 0.2f * motion[i];
+                sig = Spread(ZeroShot(a));
+                dn = Spread(DinoFromSiglip(a));
             }
             float[] raw = new float[a.Count];
             for (int i = 0; i < a.Count; i++)
                 raw[i] = source == Source.Siglip ? sig[i] : source == Source.Dino ? dn[i] : (sig[i] + dn[i]) / 2;
             return Smooth(raw, 2);
+        }
+
+        // The current prompts' score for each step, from the cached image embeddings, so editing prompts needs no re-analysis.
+        static Analysis zeroFor;
+        static PromptSet zeroSet;
+        static float[] zeroCache;
+
+        public static float[] ZeroShot(Analysis a)
+        {
+            var set = PromptSet.Current;
+            lock (typeof(Scoring))
+            {
+                if (zeroFor != a || zeroSet != set) { zeroCache = set.Scores(a); zeroFor = a; zeroSet = set; }
+                return zeroCache;
+            }
+        }
+
+        // DINOv2 has no text side, so until it has learned from you it learns from SigLIP: the quarter of this video's
+        // steps SigLIP is surest are action and the quarter it is surest are idle train a classifier on DINOv2's features,
+        // which then judges every step by what is on screen. Camera movement alone doesn't count as action.
+        static Analysis dinoFor;
+        static PromptSet dinoSet;
+        static float[] dinoCache;
+
+        public static float[] DinoFromSiglip(Analysis a)
+        {
+            var set = PromptSet.Current;
+            lock (typeof(Scoring))
+                if (dinoFor == a && dinoSet == set) return dinoCache;
+            var zero = ZeroShot(a);
+            var result = new float[a.Count];
+            if (a.Count >= 8)
+            {
+                var order = Enumerable.Range(0, a.Count).OrderBy(i => zero[i]).ToArray();
+                int q = Math.Max(2, a.Count / 4), stride = Math.Max(1, q / 1000);   // at most about 2000 examples
+                var x = new List<float[]>();
+                var y = new List<bool>();
+                for (int k = 0; k < q; k += stride)
+                {
+                    x.Add(a.Dino[order[a.Count - 1 - k]]); y.Add(true);
+                    x.Add(a.Dino[order[k]]); y.Add(false);
+                }
+                float b;
+                var w = Learner.Fit(x, y, out b);
+                for (int i = 0; i < a.Count; i++) result[i] = b + Models.Dot(w, a.Dino[i]);
+            }
+            lock (typeof(Scoring)) { dinoCache = result; dinoFor = a; dinoSet = set; }
+            return result;
         }
 
         // Maps the 5th..95th percentile of a series onto 0..1.
@@ -233,6 +279,15 @@ namespace IdleTrim
             }
             list.RemoveAll(s => s.Length < 0.2);
             return list;
+        }
+
+        // Same, but a split (the step a new part starts at) also ends a run.
+        public static void RunAt(bool[] keep, int i, HashSet<int> splits, out int start, out int end)
+        {
+            start = i;
+            end = i;
+            while (start > 0 && keep[start - 1] == keep[i] && !splits.Contains(start)) start--;
+            while (end < keep.Length - 1 && keep[end + 1] == keep[i] && !splits.Contains(end + 1)) end++;
         }
 
         // The run of equal keep/cut steps that contains step i.

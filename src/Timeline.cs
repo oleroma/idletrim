@@ -8,19 +8,35 @@ using System.Windows.Forms;
 
 namespace IdleTrim
 {
-    // Film strip, action graph and keep/cut band in one control. Click or drag to scrub, click the band to flip a part.
+    // Film strip, action graph and keep/cut band in one control. Click or drag the strip to scrub. On the band, drag to add a
+    // kept part (it merges with any part it touches), right-drag to cut, right-click a part to remove it, drag a part's edge
+    // to move it. S splits a part at the playhead, I and O mark a range for K (keep) or X (cut), Ctrl+Z undoes.
     class Timeline : Control
     {
         Analysis analysis;
         float[] scores;
         bool[] keep;
         sbyte[] overrides;
+        HashSet<int> splits = new HashSet<int>();
         double threshold, playhead;
+        double markIn = double.NaN, markOut = double.NaN;
+        int dragEdge = -1;
+        double viewStart, viewLen;   // the part of the video on screen; viewLen 0 means all of it
+        public const double MinView = 5;
+        bool dragLeftKept;
+        int bandFrom = -1, bandX;     // a drag across the band: where it started
+        bool bandKeep, bandMoved;
         readonly Dictionary<int, Bitmap> thumbs = new Dictionary<int, Bitmap>();
         bool scrubbing;
 
         public event EventHandler PlayheadChanged;
-        public event Action<int> ToggleRequested;   // step index of the part to flip
+        public event Action<int> RemoveRequested;   // step index inside the part to remove
+        public event Action<int, int, bool, bool> RangeDragged;   // first step, end step (exclusive), keep, first move of the drag
+        public event Action UndoRequested;
+        public event Action PlayRequested;
+        public event Action<int> SplitRequested;    // step index where the new part starts
+        public event Action<int, int, bool> RangeRequested;   // first step, end step (exclusive), keep
+        public event Action<int, int, bool, bool> EdgeDragged;   // boundary step, step it moved to, whether the left side is kept, first move of the drag
 
         public Timeline()
         {
@@ -38,12 +54,14 @@ namespace IdleTrim
         int BandH { get { return Theme.S(14); } }
         int Gap { get { return Theme.S(4); } }
         int BandTop { get { return StripH + GraphH + Gap * 2; } }
-        public int PreferredHeight { get { return BandTop + BandH + 2; } }
+        int BarTop { get { return BandTop + BandH + Theme.S(5); } }
+        int BarH { get { return Theme.S(4); } }
+        public int PreferredHeight { get { return BarTop + BarH + 1; } }
 
         public double Playhead
         {
             get { return playhead; }
-            set { playhead = analysis == null ? 0 : Math.Max(0, Math.Min(analysis.Duration, value)); Invalidate(); }
+            set { playhead = analysis == null ? 0 : Math.Max(0, Math.Min(analysis.Duration, value)); FollowPlayhead(); Invalidate(); }
         }
 
         public void SetAnalysis(Analysis a)
@@ -52,20 +70,98 @@ namespace IdleTrim
             thumbs.Clear();
             analysis = a;
             playhead = 0;
+            viewStart = viewLen = 0;
+            ClearMarks();
             Invalidate();
         }
 
-        public void SetResult(float[] scores, bool[] keep, sbyte[] overrides, double threshold)
+        public void SetResult(float[] scores, bool[] keep, sbyte[] overrides, HashSet<int> splits, double threshold)
         {
             this.scores = scores;
             this.keep = keep;
             this.overrides = overrides;
+            this.splits = splits ?? new HashSet<int>();
             this.threshold = threshold;
             Invalidate();
         }
 
-        float X(double seconds) { return analysis == null ? 0 : (float)(seconds / analysis.Duration * (Width - 1)); }
-        double TimeAt(int x) { return analysis == null ? 0 : Math.Max(0, Math.Min(analysis.Duration, (double)x / Math.Max(1, Width - 1) * analysis.Duration)); }
+        public bool Scrubbing { get { return scrubbing; } }   // the mouse is down on the strip
+        public double MarkIn { get { return markIn; } }
+        public double MarkOut { get { return markOut; } }
+        public bool HasRange { get { return !double.IsNaN(markIn) && !double.IsNaN(markOut) && Math.Abs(markOut - markIn) >= Analysis.Step / 2; } }
+
+        public void ClearMarks()
+        {
+            markIn = markOut = double.NaN;
+            Invalidate();
+        }
+
+        int StepEdge(double seconds) { return analysis == null ? 0 : Math.Max(0, Math.Min(analysis.Count, (int)Math.Round(seconds / Analysis.Step))); }
+
+        // Where a kept part starts or ends, within a few pixels of x; -1 if none.
+        int EdgeNear(int x)
+        {
+            if (keep == null || keep.Length == 0) return -1;
+            int best = -1;
+            float bestDist = Theme.S(6) + 0.5f;
+            for (int b = 0; b <= keep.Length; b++)
+            {
+                bool edge = b == 0 ? keep[0] : b == keep.Length ? keep[b - 1] : keep[b - 1] != keep[b];
+                if (!edge) continue;
+                float d = Math.Abs(X(analysis.TimeOf(b)) - x);
+                if (d < bestDist) { bestDist = d; best = b; }
+            }
+            return best;
+        }
+
+        // ---- view: Ctrl+wheel zooms around the pointer, the wheel scrolls ----
+
+        public double ViewStart { get { return viewStart; } }
+        public double ViewLength { get { return analysis == null ? 0 : viewLen > 0 ? viewLen : analysis.Duration; } }
+        public bool Zoomed { get { return analysis != null && ViewLength < analysis.Duration - 1e-6; } }
+
+        internal Func<bool> CtrlIsDown = () => (ModifierKeys & Keys.Control) != 0;
+
+        public void SetView(double start, double length)
+        {
+            if (analysis == null) return;
+            double d = analysis.Duration;
+            viewLen = Math.Max(Math.Min(MinView, d), Math.Min(d, length));
+            viewStart = Math.Max(0, Math.Min(d - viewLen, start));
+            if (viewLen >= d - 1e-6) { viewLen = 0; viewStart = 0; }
+            Invalidate();
+        }
+
+        // Pages the view along when the playhead leaves it, as during playback or arrow scrubbing.
+        void FollowPlayhead()
+        {
+            if (!Zoomed || scrubbing) return;
+            double len = ViewLength;
+            if (playhead < viewStart || playhead > viewStart + len)
+                SetView(playhead - len * 0.1, len);
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            if (analysis == null) { base.OnMouseWheel(e); return; }
+            double notches = e.Delta / 120.0;
+            double len = ViewLength;
+            if (CtrlIsDown())
+            {
+                double anchor = TimeAt(e.X), frac = (double)e.X / Math.Max(1, Width - 1);
+                double newLen = len * Math.Pow(0.8, notches);
+                SetView(anchor - frac * Math.Max(Math.Min(MinView, analysis.Duration), Math.Min(analysis.Duration, newLen)), newLen);
+            }
+            else if (Zoomed)
+                SetView(viewStart - notches * len * 0.15, len);
+            else { base.OnMouseWheel(e); return; }
+            var h = e as HandledMouseEventArgs;
+            if (h != null) h.Handled = true;   // don't also scroll the window
+            if (scrubbing) Scrub(TimeAt(e.X));
+        }
+
+        float X(double seconds) { return analysis == null ? 0 : (float)((seconds - viewStart) / ViewLength * (Width - 1)); }
+        double TimeAt(int x) { return analysis == null ? 0 : Math.Max(0, Math.Min(analysis.Duration, viewStart + (double)x / Math.Max(1, Width - 1) * ViewLength)); }
 
         void Scrub(double seconds)
         {
@@ -76,12 +172,24 @@ namespace IdleTrim
         protected override void OnMouseDown(MouseEventArgs e)
         {
             Focus();
-            if (analysis == null || e.Button != MouseButtons.Left) return;
-            if (e.Y >= BandTop - Gap)
+            if (analysis == null || (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right)) return;
+            if (e.Y >= BandTop - Gap && keep != null)
             {
-                if (ToggleRequested != null) ToggleRequested(analysis.StepAt(TimeAt(e.X)));
+                int edge = e.Button == MouseButtons.Left ? EdgeNear(e.X) : -1;
+                if (edge >= 0)
+                {
+                    dragEdge = edge;
+                    dragLeftKept = edge > 0 ? keep[edge - 1] : !keep[0];
+                    if (EdgeDragged != null) EdgeDragged(edge, edge, dragLeftKept, true);
+                    return;
+                }
+                bandFrom = analysis.StepAt(TimeAt(e.X));
+                bandX = e.X;
+                bandKeep = e.Button == MouseButtons.Left;
+                bandMoved = false;
                 return;
             }
+            if (e.Button != MouseButtons.Left) return;
             scrubbing = true;
             Scrub(TimeAt(e.X));
             base.OnMouseDown(e);
@@ -90,14 +198,35 @@ namespace IdleTrim
         protected override void OnMouseMove(MouseEventArgs e)
         {
             if (scrubbing) Scrub(TimeAt(e.X));
+            else if (dragEdge >= 0) { if (EdgeDragged != null) EdgeDragged(dragEdge, StepEdge(TimeAt(e.X)), dragLeftKept, false); }
+            else if (bandFrom >= 0)
+            {
+                if (!bandMoved && Math.Abs(e.X - bandX) < Theme.S(4)) return;
+                int to = analysis.StepAt(TimeAt(e.X));
+                if (RangeDragged != null) RangeDragged(Math.Min(bandFrom, to), Math.Max(bandFrom, to) + 1, bandKeep, !bandMoved);
+                bandMoved = true;
+            }
+            else if (analysis != null) Cursor = e.Y >= BandTop - Gap ? (EdgeNear(e.X) >= 0 ? Cursors.SizeWE : Cursors.Default) : Cursors.Default;
             base.OnMouseMove(e);
         }
 
-        protected override void OnMouseUp(MouseEventArgs e) { scrubbing = false; base.OnMouseUp(e); }
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            // A click on the band without dragging: left moves the playhead there, right removes the part under it.
+            if (bandFrom >= 0 && !bandMoved)
+            {
+                if (bandKeep) Scrub(TimeAt(e.X));
+                else if (RemoveRequested != null) RemoveRequested(bandFrom);
+            }
+            bandFrom = -1;
+            scrubbing = false;
+            dragEdge = -1;
+            base.OnMouseUp(e);
+        }
         protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
         protected override void OnLostFocus(EventArgs e) { StopHold(); Invalidate(); base.OnLostFocus(e); }
 
-        // ---- keyboard: arrows scrub (hold Shift for 10x, switchable mid-hold), Space flips the part under the playhead ----
+        // ---- keyboard: arrows scrub (hold Shift for 10x, switchable mid-hold), Space plays, Delete removes the part under the playhead ----
 
         [DllImport("user32.dll")]
         static extern short GetAsyncKeyState(Keys key);
@@ -124,7 +253,7 @@ namespace IdleTrim
         protected override bool IsInputKey(Keys k)
         {
             Keys code = k & Keys.KeyCode;
-            return code == Keys.Left || code == Keys.Right || code == Keys.Space || base.IsInputKey(k);
+            return code == Keys.Left || code == Keys.Right || code == Keys.Space || code == Keys.Escape || base.IsInputKey(k);
         }
 
         protected override void OnKeyDown(KeyEventArgs e)
@@ -143,8 +272,27 @@ namespace IdleTrim
                 case Keys.Home: Scrub(0); break;
                 case Keys.End: Scrub(analysis.Duration); break;
                 case Keys.Space:
-                    if (ToggleRequested != null) ToggleRequested(analysis.StepAt(playhead));
+                    if (PlayRequested != null) PlayRequested();
                     e.SuppressKeyPress = true;
+                    break;
+                case Keys.Z:
+                    if (e.Control && UndoRequested != null) UndoRequested();
+                    break;
+                case Keys.S:
+                    if (SplitRequested != null) SplitRequested(StepEdge(playhead));
+                    break;
+                case Keys.I: markIn = playhead; Invalidate(); break;
+                case Keys.O: markOut = playhead; Invalidate(); break;
+                case Keys.Escape: ClearMarks(); break;
+                case Keys.K:
+                case Keys.X:
+                case Keys.Delete:
+                    if (HasRange && RangeRequested != null)
+                    {
+                        RangeRequested(StepEdge(Math.Min(markIn, markOut)), StepEdge(Math.Max(markIn, markOut)), e.KeyCode == Keys.K);
+                        ClearMarks();
+                    }
+                    else if (e.KeyCode == Keys.Delete && RemoveRequested != null) RemoveRequested(analysis.StepAt(playhead));
                     break;
             }
             base.OnKeyDown(e);
@@ -188,7 +336,7 @@ namespace IdleTrim
             int w = Width;
             Theme.Fill(g, Theme.Surface, new RectangleF(0, 0, w - 1, StripH), Theme.S(6));
             Theme.Fill(g, Theme.Surface, new RectangleF(0, StripH + Gap, w - 1, GraphH), Theme.S(6));
-            Theme.Fill(g, Theme.Surface, new RectangleF(0, BandTop, w - 1, BandH), BandH / 2f);
+            using (var track = new SolidBrush(Theme.Surface)) g.FillRectangle(track, 0, BandTop, w - 1, BandH);
             if (analysis == null || analysis.Count == 0)
             {
                 Theme.Draw(g, "Load a video to see its timeline", Font, Theme.Faint, new Rectangle(0, 0, w, StripH), TextFormatFlags.HorizontalCenter);
@@ -200,8 +348,9 @@ namespace IdleTrim
             {
                 g.SetClip(clip);
                 int tw = StripH * 16 / 9;
-                for (int x = 0; x < w; x += tw)
-                    g.DrawImageUnscaled(Thumb(analysis.StepAt(TimeAt(x + tw / 2))), x, 0);
+                double tileT = tw / Math.Max(1.0, w - 1) * ViewLength;
+                for (double t = Math.Floor(viewStart / tileT) * tileT; t < viewStart + ViewLength; t += tileT)
+                    g.DrawImageUnscaled(Thumb(analysis.StepAt(Math.Min(analysis.Duration, t + tileT / 2))), (int)Math.Floor(X(t)), 0);
                 if (keep != null)
                     using (var dim = new SolidBrush(Color.FromArgb(170, Theme.Bg)))
                         ForRuns(false, (a, b) => g.FillRectangle(dim, a, 0, b - a, StripH));
@@ -213,9 +362,13 @@ namespace IdleTrim
             if (scores != null && scores.Length > 1)
             {
                 float top = StripH + Gap + 3, h = GraphH - 6;
-                var pts = new PointF[scores.Length];
-                for (int i = 0; i < scores.Length; i++)
-                    pts[i] = new PointF(X(analysis.TimeOf(i) + Analysis.Step / 2), top + h - scores[i] * h);
+                int i0 = Math.Max(0, analysis.StepAt(viewStart) - 1), i1 = Math.Min(scores.Length - 1, analysis.StepAt(viewStart + ViewLength) + 1);
+                var pts = new PointF[Math.Max(2, i1 - i0 + 1)];
+                for (int i = 0; i < pts.Length; i++)
+                {
+                    int j = Math.Min(scores.Length - 1, i0 + i);
+                    pts[i] = new PointF(X(analysis.TimeOf(j) + Analysis.Step / 2), top + h - scores[j] * h);
+                }
                 var area = new List<PointF>(pts);
                 area.Add(new PointF(pts[pts.Length - 1].X, top + h));
                 area.Add(new PointF(pts[0].X, top + h));
@@ -228,24 +381,38 @@ namespace IdleTrim
                     g.DrawLine(dash, 0, ty, w, ty);
             }
 
-            // Keep/cut band; parts you flipped by hand get a light outline.
+            // Marked range.
+            if (!double.IsNaN(markIn) || !double.IsNaN(markOut))
+            {
+                double a0 = double.IsNaN(markIn) ? markOut : markIn, b0 = double.IsNaN(markOut) ? markIn : markOut;
+                float ra = X(Math.Min(a0, b0)), rb = X(Math.Max(a0, b0));
+                using (var fill = new SolidBrush(Color.FromArgb(45, Theme.Text)))
+                    g.FillRectangle(fill, ra, 0, Math.Max(2, rb - ra), BandTop - Gap);
+                using (var pen = new Pen(Theme.Text, 1))
+                {
+                    if (!double.IsNaN(markIn)) g.DrawLine(pen, X(markIn), 0, X(markIn), BandTop - Gap);
+                    if (!double.IsNaN(markOut)) g.DrawLine(pen, X(markOut), 0, X(markOut), BandTop - Gap);
+                }
+            }
+
+            // Keep/cut band; splits get a notch.
             if (keep != null)
             {
-                float r = BandH / 2f;
-                ForRuns(true, (a, b) => Theme.Fill(g, Theme.Accent, new RectangleF(a, BandTop, Math.Max(BandH, b - a), BandH), r));
-                if (overrides != null)
-                    using (var pen = new Pen(Theme.Text, 1.5f))
-                    {
-                        int i = 0;
-                        while (i < overrides.Length)
-                        {
-                            if (overrides[i] == 0) { i++; continue; }
-                            int s = i;
-                            while (i < overrides.Length && overrides[i] != 0) i++;
-                            float a = X(analysis.TimeOf(s)), b = X(analysis.TimeOf(i));
-                            g.DrawLine(pen, a + 2, BandTop + BandH + 1, b - 2, BandTop + BandH + 1);
-                        }
-                    }
+                g.SmoothingMode = SmoothingMode.None;
+                using (var part = new SolidBrush(Theme.Accent))
+                    ForRuns(true, (a, b) => g.FillRectangle(part, a, BandTop, Math.Max(2, b - a), BandH));
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var notch = new Pen(BackColor, Theme.S(3)))
+                    foreach (int sp in splits)
+                        if (sp > 0 && sp < keep.Length) g.DrawLine(notch, X(analysis.TimeOf(sp)), BandTop - 1, X(analysis.TimeOf(sp)), BandTop + BandH + 1);
+            }
+
+            // Where the view sits in the whole video, when zoomed.
+            if (Zoomed)
+            {
+                float bx = (float)(viewStart / analysis.Duration * (w - 1)), bw = Math.Max(Theme.S(12), (float)(ViewLength / analysis.Duration * (w - 1)));
+                Theme.Fill(g, Theme.Surface, new RectangleF(0, BarTop, w - 1, BarH), BarH / 2f);
+                Theme.Fill(g, Theme.Faint, new RectangleF(bx, BarTop, bw, BarH), BarH / 2f);
             }
 
             // Playhead.
@@ -270,7 +437,8 @@ namespace IdleTrim
                 if (keep[i] != value) { i++; continue; }
                 int s = i;
                 while (i < keep.Length && keep[i] == value) i++;
-                draw(X(analysis.TimeOf(s)), X(analysis.TimeOf(i)));
+                float x0 = X(analysis.TimeOf(s)), x1 = X(analysis.TimeOf(i));
+                if (x1 >= -BandH && x0 <= Width + BandH) draw(Math.Max(-BandH, x0), Math.Min(Width + BandH, x1));
             }
         }
     }
@@ -279,6 +447,8 @@ namespace IdleTrim
     class Preview : Control
     {
         Image image;
+        Bitmap live;   // reused for playback frames
+        bool playing;
         int shownStep = -1;
         public string Badge, Caption;
         public bool Kept;
@@ -288,8 +458,27 @@ namespace IdleTrim
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         }
 
+        // A playback frame: packed BGR, w x h.
+        public void ShowFrame(byte[] bgr, int w, int h)
+        {
+            if (live == null || live.Width != w || live.Height != h)
+            {
+                if (live != null) live.Dispose();
+                live = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            }
+            var data = live.LockBits(new Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.WriteOnly, live.PixelFormat);
+            for (int y = 0; y < h; y++)
+                System.Runtime.InteropServices.Marshal.Copy(bgr, y * w * 3, data.Scan0 + y * data.Stride, w * 3);
+            live.UnlockBits(data);
+            playing = true;
+            Invalidate();
+        }
+
+        public bool Playing { get { return playing; } }
+
         public void Show(Analysis a, int step)
         {
+            playing = false;
             if (a == null) { SetImage(null, -1); return; }
             if (step == shownStep) { Invalidate(); return; }
             using (var ms = new MemoryStream(a.Previews[step]))
@@ -317,13 +506,14 @@ namespace IdleTrim
             using (var path = Theme.Round(box, Theme.S(8)))
             {
                 using (var b = new SolidBrush(Theme.Surface)) g.FillPath(b, path);
-                if (image == null)
+                var shown = playing ? live : image;
+                if (shown == null)
                 {
                     Theme.Draw(g, "Drop a gameplay video", Font, Theme.Faint, box, TextFormatFlags.HorizontalCenter);
                     return;
                 }
                 g.SetClip(path);
-                g.DrawImage(image, box);
+                g.DrawImage(shown, box);
                 if (!Kept)
                     using (var dim = new SolidBrush(Color.FromArgb(120, Theme.Bg))) g.FillRectangle(dim, box);
                 g.ResetClip();
@@ -347,6 +537,7 @@ namespace IdleTrim
         protected override void Dispose(bool disposing)
         {
             if (disposing && image != null) image.Dispose();
+            if (disposing && live != null) live.Dispose();
             base.Dispose(disposing);
         }
     }

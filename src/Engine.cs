@@ -18,6 +18,9 @@ namespace IdleTrim
         public int Width, Height;
         public double Fps;
         public bool HasAudio;
+        public string VideoCodec = "", AudioCodec = "";   // ffprobe codec names, e.g. hevc, aac
+
+        public string Ext { get { string e = System.IO.Path.GetExtension(Path).ToLowerInvariant(); return e.Length > 1 ? e : ".mp4"; } }
 
         public int ShortSide { get { return Math.Min(Width, Height); } }
         public int LongSide { get { return Math.Max(Width, Height); } }
@@ -33,6 +36,9 @@ namespace IdleTrim
         public int Short;        // used when AutoRes is off
         public int Fps;          // used when AutoFps is off
         public bool Nvenc, Mute;
+        public string Encoder;        // ffmpeg video encoder; null means libx264, or h264_nvenc with Nvenc
+        public string Ext = ".mp4";   // output container
+        public bool Copy;             // keep the source streams as they are: no re-encode, parts start at keyframes
         public List<Segment> Segments;   // when set, only these parts are kept, joined in order; trim is ignored
     }
 
@@ -113,8 +119,9 @@ namespace IdleTrim
             p.Kept = Math.Max(0.1, s.Segments != null ? Segment.Total(s.Segments) : end - s.TrimStart);
 
             bool hasAudio = v.HasAudio && !s.Mute;
-            int minVideo = s.Nvenc ? MinVideoNvenc : MinVideoX264;
-            double floor = s.Nvenc ? FloorNvenc : FloorX264;
+            bool gpu = VideoEncoder(s).EndsWith("_nvenc");
+            int minVideo = gpu ? MinVideoNvenc : MinVideoX264;
+            double floor = gpu ? FloorNvenc : FloorX264;
 
             double minBytes = (minVideo + (hasAudio ? MinAudio : 0)) * 1000.0 * p.Kept / 8 / Usable;
             double sourceMB = v.SizeBytes * (p.Kept / v.Duration) / Mb;
@@ -206,6 +213,31 @@ namespace IdleTrim
         }
 
         static int Clamp(int x, int lo, int hi) { return Math.Max(lo, Math.Min(hi, x)); }
+
+        public static string VideoEncoder(Settings s) { return s.Encoder ?? (s.Nvenc ? "h264_nvenc" : "libx264"); }
+
+        // The encoder that writes the source's own codec: on the GPU when it can, otherwise on the CPU. Null if none is available.
+        public static string OriginalEncoder(string ffmpeg, VideoInfo v)
+        {
+            string[] options;
+            switch (v.VideoCodec)
+            {
+                case "h264": options = new[] { "h264_nvenc", "libx264" }; break;
+                case "hevc": options = new[] { "hevc_nvenc", "libx265" }; break;
+                case "av1": options = new[] { "av1_nvenc", "libsvtav1" }; break;
+                default: return null;
+            }
+            foreach (string e in options)
+                if (HasEncoder(ffmpeg, e)) return e;
+            return null;
+        }
+
+        public static string CodecName(string codec)
+        {
+            switch (codec) { case "h264": return "H.264"; case "hevc": return "HEVC"; case "av1": return "AV1"; default: return codec.ToUpperInvariant(); }
+        }
+
+        static bool Mp4Like(string ext) { return ext == ".mp4" || ext == ".mov" || ext == ".m4v"; }
 
         // ---- ffmpeg discovery and download ----
 
@@ -300,13 +332,14 @@ namespace IdleTrim
         {
             var v = new VideoInfo { Path = path, SizeBytes = new FileInfo(path).Length };
             string text = Capture(ffprobe, string.Format(
-                "-v error -select_streams v:0 -show_entries stream=width,height,avg_frame_rate,r_frame_rate:format=duration -of default=nw=1 \"{0}\"", path));
+                "-v error -select_streams v:0 -show_entries stream=codec_name,width,height,avg_frame_rate,r_frame_rate:format=duration -of default=nw=1 \"{0}\"", path));
             double avg = 0, raw = 0;
             foreach (string line in text.Split('\n'))
             {
                 string[] kv = line.Trim().Split(new[] { '=' }, 2);
                 if (kv.Length != 2) continue;
-                if (kv[0] == "width") int.TryParse(kv[1], out v.Width);
+                if (kv[0] == "codec_name") v.VideoCodec = kv[1].Trim();
+                else if (kv[0] == "width") int.TryParse(kv[1], out v.Width);
                 else if (kv[0] == "height") int.TryParse(kv[1], out v.Height);
                 else if (kv[0] == "duration") double.TryParse(kv[1], NumberStyles.Float, CultureInfo.InvariantCulture, out v.Duration);
                 else if (kv[0] == "avg_frame_rate") avg = ParseRate(kv[1]);
@@ -316,8 +349,10 @@ namespace IdleTrim
                 throw new Exception("This file doesn't look like a video that can be read.");
             v.Fps = avg > 0 ? avg : raw > 0 ? raw : 30;
             string audio = Capture(ffprobe, string.Format(
-                "-v error -select_streams a:0 -show_entries stream=codec_type -of default=nw=1 \"{0}\"", path));
+                "-v error -select_streams a:0 -show_entries stream=codec_type,codec_name -of default=nw=1 \"{0}\"", path));
             v.HasAudio = audio.Contains("audio");
+            foreach (string line in audio.Split('\n'))
+                if (line.StartsWith("codec_name=")) v.AudioCodec = line.Substring(11).Trim();
             return v;
         }
 
@@ -332,21 +367,51 @@ namespace IdleTrim
 
         // ---- encoding ----
 
-        public static string OutputPath(string input)
+        public static string OutputPath(string input, string ext = ".mp4")
         {
             string dir = Path.GetDirectoryName(input);
             string name = Path.GetFileNameWithoutExtension(input) + "_idletrim";
-            string path = Path.Combine(dir, name + ".mp4");
+            string path = Path.Combine(dir, name + ext);
             for (int i = 2; File.Exists(path); i++)
-                path = Path.Combine(dir, string.Format("{0} ({1}).mp4", name, i));
+                path = Path.Combine(dir, string.Format("{0} ({1}){2}", name, i, ext));
             return path;
+        }
+
+        // Copies the kept parts without re-encoding. Each part starts at the keyframe at or before its start.
+        public static long Copy(string ffmpeg, VideoInfo v, Settings s, string output, Action<double, string> progress, CancelFlag cancel)
+        {
+            var c = CultureInfo.InvariantCulture;
+            string part = output + ".part" + s.Ext;
+            string list = Path.Combine(Path.GetTempPath(), "idletrim-" + Guid.NewGuid().ToString("N") + ".ffconcat");
+            var text = new StringBuilder("ffconcat version 1.0\n");
+            string file = v.Path.Replace('\\', '/').Replace("'", "'\\''");
+            foreach (var seg in s.Segments)
+                text.AppendFormat(c, "file '{0}'\ninpoint {1:0.###}\noutpoint {2:0.###}\n", file, seg.Start, seg.End);
+            File.WriteAllText(list, text.ToString());
+            try
+            {
+                string args = "-hide_banner -loglevel error -nostats -nostdin -progress pipe:1 -y -f concat -safe 0 -i" + Quote(list) +
+                              " -map 0:v:0" + (v.HasAudio && !s.Mute ? " -map 0:a:0" : " -an") + " -sn -dn -c copy -avoid_negative_ts make_zero" +
+                              (Mp4Like(s.Ext) ? " -movflags +faststart" : "") + Quote(part);
+                Encode(ffmpeg, args, Segment.Total(s.Segments), f => progress(f, "Copying"), cancel);
+                File.Move(part, output);
+                progress(1, "Done");
+                return new FileInfo(output).Length;
+            }
+            finally
+            {
+                try { File.Delete(part); } catch { }
+                try { File.Delete(list); } catch { }
+            }
         }
 
         // Returns the size of the finished file. The output only appears once it fits the target.
         public static long Run(string ffmpeg, VideoInfo v, Settings s, Plan p, string output,
                                Action<double, string> progress, CancelFlag cancel)
         {
-            string part = output + ".part.mp4";
+            if (s.Copy) return Copy(ffmpeg, v, s, output, progress, cancel);
+            string part = output + ".part" + s.Ext;
+            string encoder = VideoEncoder(s);
             string passlog = Path.Combine(Path.GetTempPath(), "idletrim-" + Guid.NewGuid().ToString("N"));
             string graph = passlog + "-graph.txt";
             if (s.Segments != null)
@@ -355,23 +420,23 @@ namespace IdleTrim
                 File.WriteAllText(graph + ".silent", Graph(v, s, p, false));
             }
             long targetBytes = (long)(p.TargetMB * Mb);
-            int minVideo = s.Nvenc ? MinVideoNvenc : MinVideoX264;
+            int minVideo = encoder.EndsWith("_nvenc") ? MinVideoNvenc : MinVideoX264;
             int video = p.VideoKbps;
             try
             {
                 for (int attempt = 1; attempt <= 4; attempt++)
                 {
                     string label = attempt == 1 ? "" : string.Format(" (retry {0})", attempt - 1);
-                    if (s.Nvenc)
+                    if (encoder != "libx264")
                     {
-                        Encode(ffmpeg, BaseArgs(v, s, p, graph) + NvencArgs(video) + AudioArgs(s, p) + Quote(part), p.Kept,
+                        Encode(ffmpeg, BaseArgs(v, s, p, graph) + OnePassArgs(encoder, video, s.Ext) + AudioArgs(v, s, p) + Quote(part), p.Kept,
                                f => progress(f, "Encoding" + label), cancel);
                     }
                     else
                     {
                         Encode(ffmpeg, BaseArgs(v, s, p, graph + ".silent") + X264Args(video) + string.Format(" -pass 1 -passlogfile {0} -an -f null NUL", Quote(passlog)), p.Kept,
                                f => progress(f * 0.35, "Analysing" + label), cancel);
-                        Encode(ffmpeg, BaseArgs(v, s, p, graph) + X264Args(video) + string.Format(" -pass 2 -passlogfile {0}", Quote(passlog)) + AudioArgs(s, p) + Quote(part), p.Kept,
+                        Encode(ffmpeg, BaseArgs(v, s, p, graph) + X264Args(video) + string.Format(" -pass 2 -passlogfile {0}", Quote(passlog)) + AudioArgs(v, s, p) + Quote(part), p.Kept,
                                f => progress(0.35 + f * 0.65, "Encoding" + label), cancel);
                     }
 
@@ -468,16 +533,26 @@ namespace IdleTrim
             return string.Format(" -c:v libx264 -preset slow -b:v {0}k -maxrate {1}k -bufsize {2}k", video, video * 3 / 2, video * 2);
         }
 
-        static string NvencArgs(int video)
+        static string OnePassArgs(string encoder, int video, string ext)
         {
-            return string.Format(" -c:v h264_nvenc -preset p7 -tune hq -rc vbr -multipass fullres -b:v {0}k -maxrate {1}k -bufsize {2}k", video, video * 3 / 2, video * 2);
+            string rate = string.Format(" -b:v {0}k -maxrate {1}k -bufsize {2}k", video, video * 3 / 2, video * 2);
+            string tag = Mp4Like(ext) && (encoder.StartsWith("hevc") || encoder == "libx265") ? " -tag:v hvc1" : "";
+            if (encoder.EndsWith("_nvenc"))
+                return " -c:v " + encoder + " -preset p7 -tune hq -rc vbr -multipass fullres" + rate + tag;
+            if (encoder == "libx265")
+                return " -c:v libx265 -preset medium -x265-params log-level=error" + rate + tag;
+            if (encoder == "libsvtav1")
+                return string.Format(" -c:v libsvtav1 -preset 8 -b:v {0}k", video);
+            throw new Exception("Unknown encoder " + encoder);
         }
 
-        static string AudioArgs(Settings s, Plan p)
+        // Opus stays Opus in MKV; everything else becomes AAC.
+        static string AudioArgs(VideoInfo v, Settings s, Plan p)
         {
             string source = s.Segments != null ? "\"[a]\"" : "0:a:0";
-            string audio = p.AudioKbps > 0 ? string.Format(" -map {0} -c:a aac -b:a {1}k", source, p.AudioKbps) : " -an";
-            return audio + " -movflags +faststart";
+            string codec = v.AudioCodec == "opus" && s.Ext == ".mkv" ? "libopus" : "aac";
+            string audio = p.AudioKbps > 0 ? string.Format(" -map {0} -c:a {1} -b:a {2}k", source, codec, p.AudioKbps) : " -an";
+            return audio + (Mp4Like(s.Ext) ? " -movflags +faststart" : "");
         }
 
         static void Encode(string ffmpeg, string args, double kept, Action<double> progress, CancelFlag cancel)

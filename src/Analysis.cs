@@ -129,8 +129,6 @@ namespace IdleTrim
         public const int Size = 224;
 
         readonly InferenceSession siglip, dino;
-        readonly float[][] prompts;
-        readonly int actionCount;
         public readonly bool OnGpu;
 
         public static string Dir { get { return Environment.GetEnvironmentVariable("IDLETRIM_MODELS") ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models"); } }
@@ -141,7 +139,12 @@ namespace IdleTrim
 
         public static void Download(Action<int, string> progress, CancelFlag cancel)
         {
-            var files = new[] { new[] { SiglipUrl, SiglipPath, "SigLIP 2" }, new[] { DinoUrl, DinoPath, "DINOv2" } };
+            Fetch(new[] { new[] { SiglipUrl, SiglipPath, "SigLIP 2" }, new[] { DinoUrl, DinoPath, "DINOv2" } }, progress, cancel);
+        }
+
+        // files: { url, destination, name } each; files already there are skipped.
+        public static void Fetch(string[][] files, Action<int, string> progress, CancelFlag cancel)
+        {
             using (var http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) })
             {
                 for (int f = 0; f < files.Length; f++)
@@ -191,10 +194,9 @@ namespace IdleTrim
                 siglip = new InferenceSession(SiglipPath, Options(false));
                 dino = new InferenceSession(DinoPath, Options(false));
             }
-            prompts = LoadPrompts(out actionCount);
         }
 
-        static SessionOptions Options(bool gpu)
+        internal static SessionOptions Options(bool gpu)
         {
             var o = new SessionOptions();
             if (gpu)
@@ -204,29 +206,6 @@ namespace IdleTrim
                 o.AppendExecutionProvider_DML(0);
             }
             return o;
-        }
-
-        // prompts.txt: "<action|idle>\t<prompt>" then a line of 768 numbers.
-        static float[][] LoadPrompts(out int actions)
-        {
-            var list = new List<float[]>();
-            actions = 0;
-            using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("IdleTrim.prompts.txt"))
-            using (var reader = new StreamReader(stream))
-            {
-                string line;
-                while ((line = reader.ReadLine()) != null)
-                {
-                    if (line.StartsWith("#") || line.Length == 0) continue;
-                    bool action = line.StartsWith("action\t");
-                    string[] parts = reader.ReadLine().Split(' ');
-                    var v = new float[parts.Length];
-                    for (int i = 0; i < parts.Length; i++) v[i] = float.Parse(parts[i], CultureInfo.InvariantCulture);
-                    if (action) { list.Insert(actions, v); actions++; }
-                    else list.Add(v);
-                }
-            }
-            return list.ToArray();
         }
 
         // frames: 320x180 RGB24 buffers. Fills the embeddings and the zero-shot score for each.
@@ -259,14 +238,7 @@ namespace IdleTrim
                     var e = new float[Analysis.SigDim];
                     for (int i = 0; i < e.Length; i++) e[i] = pooled[b, i];
                     sig[b] = Normalise(e);
-                    float bestAction = float.MinValue, bestIdle = float.MinValue;
-                    for (int p = 0; p < prompts.Length; p++)
-                    {
-                        float dot = Dot(sig[b], prompts[p]);
-                        if (p < actionCount) bestAction = Math.Max(bestAction, dot);
-                        else bestIdle = Math.Max(bestIdle, dot);
-                    }
-                    zero[b] = bestAction - bestIdle;
+                    zero[b] = PromptSet.Current.Score(sig[b]);
                 }
             }
 
@@ -321,7 +293,7 @@ namespace IdleTrim
             return s;
         }
 
-        static float[] Normalise(float[] v)
+        public static float[] Normalise(float[] v)
         {
             float n = (float)Math.Sqrt(Dot(v, v));
             if (n > 0) for (int i = 0; i < v.Length; i++) v[i] /= n;

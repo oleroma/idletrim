@@ -17,6 +17,7 @@
     <Compile Include="../src/*.cs" />
     <EmbeddedResource Include="../src/prompts.txt" LogicalName="IdleTrim.prompts.txt" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.24.4" />
+    <PackageReference Include="NAudio.WinMM" Version="2.2.1" />
   </ItemGroup>
 
 </Project>

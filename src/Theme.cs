@@ -563,8 +563,9 @@ namespace IdleTrim
     class ThemedDialog : DarkForm
     {
         public readonly string Content;
+        public readonly Toggle Option;   // an optional tick box under the text, e.g. "Don't ask again"
 
-        public ThemedDialog(string title, string[,] rows, string okText, string cancelText)
+        public ThemedDialog(string title, string[,] rows, string okText, string cancelText, string optionText = null)
         {
             Text = title;
             FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -595,13 +596,21 @@ namespace IdleTrim
                 grid.Controls.Add(v, 1, i);
             }
             Content = all.ToString();
+            int extra = 0;
+            if (optionText != null)
+            {
+                Option = new Toggle(optionText) { Margin = new Padding(0, Theme.S(10), 0, 0) };
+                grid.Controls.Add(Option, 0, count);
+                grid.SetColumnSpan(Option, 2);
+                extra = 1;
+            }
 
             var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Anchor = AnchorStyles.Right, Margin = new Padding(0, Theme.S(14), 0, 0), AutoSizeMode = AutoSizeMode.GrowAndShrink };
             var ok = new Btn(okText, true) { DialogResult = DialogResult.OK };
             var no = new Btn(cancelText) { DialogResult = DialogResult.Cancel };
             buttons.Controls.Add(ok);
             buttons.Controls.Add(no);
-            grid.Controls.Add(buttons, 0, count);
+            grid.Controls.Add(buttons, 0, count + extra);
             grid.SetColumnSpan(buttons, 2);
             Controls.Add(grid);
             AcceptButton = ok;
