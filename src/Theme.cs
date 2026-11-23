@@ -623,4 +623,82 @@ namespace IdleTrim
                 return d.ShowDialog(owner) == DialogResult.OK;
         }
     }
+
+    // A dark drop-down list. Items are shown with ToString.
+    class Dropdown : ComboBox
+    {
+        public Dropdown()
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList;
+            FlatStyle = FlatStyle.Flat;
+            DrawMode = DrawMode.OwnerDrawFixed;
+            BackColor = Theme.Surface;
+            ForeColor = Theme.Text;
+            ItemHeight = Theme.S(22);
+            Font = new Font("Segoe UI", 9.5f);
+        }
+
+        // Windows draws the closed box with a light arrow button; paint that part over in the theme.
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            bool print = m.Msg == 0x0317 || m.Msg == 0x0318;   // WM_PRINT / WM_PRINTCLIENT: screenshots
+            if (m.Msg != 0x000F && !print) return;            // WM_PAINT
+            using (var g = print ? Graphics.FromHdc(m.WParam) : CreateGraphics())
+            {
+                int bw = Theme.S(26);
+                var button = new Rectangle(Width - bw - 1, 1, bw, Height - 2);
+                using (var b = new SolidBrush(Theme.Surface)) g.FillRectangle(b, button);
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                float cx = button.X + button.Width / 2f, cy = Height / 2f, k = Theme.S(4);
+                using (var pen = new Pen(Enabled ? Theme.Dim : Theme.Faint, Theme.S(2) / 1.4f))
+                    g.DrawLines(pen, new[] { new PointF(cx - k, cy - k / 2), new PointF(cx, cy + k / 2), new PointF(cx + k, cy - k / 2) });
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.None;
+                using (var pen = new Pen(Focused ? Theme.Accent : Theme.Raised)) g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+            }
+        }
+
+        protected override void OnDrawItem(DrawItemEventArgs e)
+        {
+            bool selected = (e.State & DrawItemState.Selected) != 0 && (e.State & DrawItemState.ComboBoxEdit) == 0;
+            using (var b = new SolidBrush(selected ? Theme.Raised : Theme.Surface)) e.Graphics.FillRectangle(b, e.Bounds);
+            if (e.Index >= 0)
+            {
+                var r = new Rectangle(e.Bounds.X + Theme.S(6), e.Bounds.Y, e.Bounds.Width - Theme.S(8), e.Bounds.Height);
+                TextRenderer.DrawText(e.Graphics, Items[e.Index].ToString(), Font, r, Enabled ? Theme.Text : Theme.Faint,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            }
+        }
+    }
+
+    // Asks for one line of text.
+    class InputDialog : DarkForm
+    {
+        public readonly TextBox Box = new TextBox { BorderStyle = BorderStyle.FixedSingle, BackColor = Theme.Surface, ForeColor = Theme.Text, Font = new Font("Segoe UI", 10f) };
+
+        public InputDialog(string title, string text, string okText)
+        {
+            Text = title;
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            MaximizeBox = MinimizeBox = false;
+            ShowInTaskbar = false;
+            ShowIcon = false;
+            StartPosition = FormStartPosition.CenterParent;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            var grid = new TableLayoutPanel { AutoSize = true, ColumnCount = 1, Padding = new Padding(Theme.S(18)), AutoSizeMode = AutoSizeMode.GrowAndShrink };
+            grid.Controls.Add(new Label { AutoSize = true, Text = text, MaximumSize = new Size(Theme.S(440), 0), UseMnemonic = false, Margin = new Padding(0, 0, 0, Theme.S(8)) }, 0, 0);
+            Box.Width = Theme.S(440);
+            grid.Controls.Add(Box, 0, 1);
+            var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Anchor = AnchorStyles.Right, Margin = new Padding(0, Theme.S(14), 0, 0) };
+            var ok = new Btn(okText, true) { DialogResult = DialogResult.OK };
+            var no = new Btn("Cancel") { DialogResult = DialogResult.Cancel };
+            buttons.Controls.Add(ok);
+            buttons.Controls.Add(no);
+            grid.Controls.Add(buttons, 0, 2);
+            Controls.Add(grid);
+            AcceptButton = ok;
+            CancelButton = no;
+        }
+    }
 }

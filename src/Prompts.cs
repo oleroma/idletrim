@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.Net.Http;
+using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -11,18 +11,41 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 
 namespace IdleTrim
 {
-    // The text prompts SigLIP 2 compares frames with. Built-in ones ship with the app; your own are saved
-    // with their embeddings in the data folder, so the text model is only needed while editing them.
+    // The text prompts a prompt model compares frames with. The texts are yours (or the built-in ones); each prompt model
+    // turns them into its own embeddings with its text side, which are kept per model until the texts change.
     public class PromptSet
     {
         public readonly List<string> Action = new List<string>(), Idle = new List<string>();
-        public readonly List<float[]> ActionEmb = new List<float[]>(), IdleEmb = new List<float[]>();
         public bool Custom;
+
+        // One model's embeddings of these texts.
+        public class Embedded
+        {
+            public readonly List<float[]> Action = new List<float[]>(), Idle = new List<float[]>();
+
+            // Best action prompt minus best idle prompt, for one normalised image embedding.
+            public float Score(float[] image)
+            {
+                float a = float.MinValue, b = float.MinValue;
+                foreach (var p in Action) a = Math.Max(a, Models.Dot(image, p));
+                foreach (var p in Idle) b = Math.Max(b, Models.Dot(image, p));
+                return a - b;
+            }
+
+            public float[] Scores(float[][] images)
+            {
+                var r = new float[images.Length];
+                for (int i = 0; i < images.Length; i++) r[i] = Score(images[i]);
+                return r;
+            }
+        }
 
         static PromptSet current;
         static readonly object gate = new object();
+        static readonly Dictionary<string, Embedded> embedded = new Dictionary<string, Embedded>();
 
         static string UserPath { get { return Path.Combine(Analysis.DataDir, "prompts.txt"); } }
+        static string EmbeddingPath(string modelId) { return Path.Combine(Analysis.DataDir, "prompts", ModelInfo.Slug(modelId) + ".txt"); }
 
         public static PromptSet Current
         {
@@ -32,8 +55,17 @@ namespace IdleTrim
                 {
                     if (current == null)
                     {
-                        current = null;
-                        try { if (File.Exists(UserPath)) { current = Parse(File.ReadAllText(UserPath)); current.Custom = true; } }
+                        try
+                        {
+                            if (File.Exists(UserPath))
+                            {
+                                Embedded legacy;
+                                current = Parse(File.ReadAllText(UserPath), out legacy);
+                                current.Custom = true;
+                                // Saved by the first version, with SigLIP 2 base's embeddings inline.
+                                if (legacy != null) embedded[Catalog.SiglipBase] = legacy;
+                            }
+                        }
                         catch (Exception) { current = null; }
                         if (current == null) current = BuiltIn();
                     }
@@ -44,114 +76,151 @@ namespace IdleTrim
 
         public static PromptSet BuiltIn()
         {
-            using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("IdleTrim.prompts.txt"))
-            using (var reader = new StreamReader(stream))
-                return Parse(reader.ReadToEnd());
+            Embedded unused;
+            return BuiltIn(out unused);
         }
 
-        // "<action|idle>\t<prompt>" then a line of 768 numbers.
-        static PromptSet Parse(string text)
+        // The built-in texts, with SigLIP 2 base's embeddings of them, made when the app was built.
+        static PromptSet BuiltIn(out Embedded baseEmbeddings)
+        {
+            using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("IdleTrim.prompts.txt"))
+            using (var reader = new StreamReader(stream))
+                return Parse(reader.ReadToEnd(), out baseEmbeddings);
+        }
+
+        // "<action|idle>\t<prompt>", each optionally followed by a line of numbers (that prompt's embedding).
+        static PromptSet Parse(string text, out Embedded emb)
         {
             var set = new PromptSet();
+            emb = new Embedded();
+            bool all = true;
             var lines = text.Replace("\r", "").Split('\n');
             for (int i = 0; i < lines.Length; i++)
             {
                 string line = lines[i];
                 if (line.StartsWith("#") || line.Length == 0) continue;
                 int tab = line.IndexOf('\t');
-                if (tab < 0 || i + 1 >= lines.Length) continue;
-                string[] parts = lines[++i].Split(' ');
-                var v = new float[parts.Length];
-                for (int k = 0; k < parts.Length; k++) v[k] = float.Parse(parts[k], CultureInfo.InvariantCulture);
+                if (tab < 0) continue;
                 bool action = line.Substring(0, tab) == "action";
                 (action ? set.Action : set.Idle).Add(line.Substring(tab + 1));
-                (action ? set.ActionEmb : set.IdleEmb).Add(v);
+                if (i + 1 < lines.Length && lines[i + 1].Length > 0 && (char.IsDigit(lines[i + 1][0]) || lines[i + 1][0] == '-'))
+                {
+                    string[] parts = lines[++i].Split(' ');
+                    var v = new float[parts.Length];
+                    for (int k = 0; k < parts.Length; k++) v[k] = float.Parse(parts[k], CultureInfo.InvariantCulture);
+                    (action ? emb.Action : emb.Idle).Add(v);
+                }
+                else all = false;
             }
             if (set.Action.Count == 0 || set.Idle.Count == 0) throw new Exception("A prompt list needs at least one action and one idle prompt.");
+            if (!all) emb = null;
             return set;
         }
 
-        public string Serialize()
+        static string Serialize(PromptSet set, Embedded emb)
         {
-            var sb = new StringBuilder("# SigLIP 2 base-patch16-224 text embeddings (pooler_output, L2-normalised).\n");
+            var sb = new StringBuilder("# IdleTrim prompts" + (emb != null ? " with one model's embeddings (L2-normalised)" : "") + ".\n");
             for (int k = 0; k < 2; k++)
             {
-                var names = k == 0 ? Action : Idle;
-                var embs = k == 0 ? ActionEmb : IdleEmb;
+                var names = k == 0 ? set.Action : set.Idle;
                 for (int i = 0; i < names.Count; i++)
                 {
                     sb.Append(k == 0 ? "action\t" : "idle\t").Append(names[i]).Append('\n');
-                    var parts = new string[embs[i].Length];
-                    for (int j = 0; j < parts.Length; j++) parts[j] = embs[i][j].ToString("0.######", CultureInfo.InvariantCulture);
-                    sb.Append(string.Join(" ", parts)).Append('\n');
+                    if (emb == null) continue;
+                    var e = (k == 0 ? emb.Action : emb.Idle)[i];
+                    sb.Append(string.Join(" ", e.Select(x => x.ToString("0.######", CultureInfo.InvariantCulture)))).Append('\n');
                 }
             }
             return sb.ToString();
         }
 
-        // Saves your own prompts and makes them the current ones.
-        public static void Save(PromptSet set)
+        bool SameTexts(PromptSet other) { return Action.SequenceEqual(other.Action) && Idle.SequenceEqual(other.Idle); }
+
+        // This model's embeddings of the current texts, or null if they haven't been made yet (see Embed).
+        public static Embedded For(string modelId)
         {
-            Directory.CreateDirectory(Analysis.DataDir);
-            File.WriteAllText(UserPath + ".tmp", set.Serialize());
-            File.Move(UserPath + ".tmp", UserPath, true);
-            set.Custom = true;
-            lock (gate) current = set;
+            var set = Current;
+            lock (gate)
+            {
+                Embedded e;
+                if (embedded.TryGetValue(modelId, out e)) return e;
+                if (modelId == Catalog.SiglipBase && !set.Custom)
+                {
+                    BuiltIn(out e);
+                    return embedded[modelId] = e;
+                }
+                try
+                {
+                    string path = EmbeddingPath(modelId);
+                    if (File.Exists(path))
+                    {
+                        var saved = Parse(File.ReadAllText(path), out e);
+                        if (e != null && saved.SameTexts(set)) return embedded[modelId] = e;
+                    }
+                }
+                catch (Exception) { }
+                return null;
+            }
         }
 
-        public static void Reset()
+        // Makes this model's embeddings of the current texts with its text side, and keeps them.
+        public static Embedded Embed(ModelInfo model)
         {
-            try { File.Delete(UserPath); } catch (IOException) { }
-            lock (gate) current = BuiltIn();
+            var set = Current;
+            var e = new Embedded();
+            using (var enc = new TextEncoder(model))
+            {
+                var all = enc.Embed(set.Action.Concat(set.Idle).ToList());
+                e.Action.AddRange(all.Take(set.Action.Count));
+                e.Idle.AddRange(all.Skip(set.Action.Count));
+            }
+            string path = EmbeddingPath(model.Id);
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            File.WriteAllText(path, Serialize(set, e));
+            lock (gate) embedded[model.Id] = e;
+            return e;
         }
 
-        // Best action prompt minus best idle prompt, for one normalised SigLIP image embedding.
-        public float Score(float[] sig)
+        // New texts: saved, and every model's embeddings start over.
+        public static void SetTexts(List<string> action, List<string> idle)
         {
-            float a = float.MinValue, b = float.MinValue;
-            foreach (var p in ActionEmb) a = Math.Max(a, Models.Dot(sig, p));
-            foreach (var p in IdleEmb) b = Math.Max(b, Models.Dot(sig, p));
-            return a - b;
+            var b = BuiltIn();
+            bool builtIn = action.SequenceEqual(b.Action) && idle.SequenceEqual(b.Idle);
+            var set = new PromptSet { Custom = !builtIn };
+            set.Action.AddRange(action);
+            set.Idle.AddRange(idle);
+            if (builtIn) { try { File.Delete(UserPath); } catch (IOException) { } }
+            else
+            {
+                Directory.CreateDirectory(Analysis.DataDir);
+                File.WriteAllText(UserPath + ".tmp", Serialize(set, null));
+                File.Move(UserPath + ".tmp", UserPath, true);
+            }
+            lock (gate)
+            {
+                current = set;
+                embedded.Clear();
+                Version++;
+            }
         }
 
-        public float[] Scores(Analysis an)
-        {
-            var r = new float[an.Count];
-            for (int i = 0; i < an.Count; i++) r[i] = Score(an.Siglip[i]);
-            return r;
-        }
+        public static int Version;   // changes when the texts do, so scores made from older embeddings are redone
     }
 
-    // SigLIP 2's text half: turns prompts into embeddings. About 600 MB, downloaded the first time you edit prompts.
+    // A prompt model's text side: turns prompts into embeddings.
     public class TextEncoder : IDisposable
     {
-        public const string ModelUrl = "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main/onnx/text_model_fp16.onnx";
-        public const string TokenizerUrl = "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main/tokenizer.json";
-        public const int Length = 64;
-
-        static string ModelPath { get { return Path.Combine(Models.Dir, "siglip2", "text_model_fp16.onnx"); } }
-        static string TokenizerPath { get { return Path.Combine(Models.Dir, "siglip2", "tokenizer.json"); } }
-
-        public static bool Present() { return File.Exists(ModelPath) && File.Exists(TokenizerPath); }
-
-        public static void Download(Action<int, string> progress, CancelFlag cancel)
-        {
-            Models.Fetch(new[] { new[] { TokenizerUrl, TokenizerPath, "the tokenizer" }, new[] { ModelUrl, ModelPath, "the SigLIP 2 text model" } }, progress, cancel);
-        }
-
         readonly Tokenizer tokenizer;
         readonly InferenceSession session;
+        public readonly int Length;
 
-        public TextEncoder()
+        public TextEncoder(ModelInfo model)
         {
-            tokenizer = new Tokenizer(TokenizerPath);
-            // The fp16 export only loads on DirectML; on the CPU it needs graph optimisations off.
-            try { session = new InferenceSession(ModelPath, Models.Options(true)); }
-            catch (Exception)
-            {
-                var o = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_DISABLE_ALL };
-                session = new InferenceSession(ModelPath, o);
-            }
+            string tokenizerPath = model.PathOf("tokenizer.json");
+            tokenizer = new Tokenizer(tokenizerPath);
+            Length = Tokenizer.FixedLength(tokenizerPath, 64);
+            bool gpu;
+            session = Models.Open(model.PathOf(model.TextFile), out gpu);
         }
 
         public int[] Tokens(string prompt) { return tokenizer.Encode(prompt.ToLowerInvariant(), Length); }
@@ -168,12 +237,12 @@ namespace IdleTrim
             var result = new float[n][];
             using (var outs = session.Run(new[] { NamedOnnxValue.CreateFromTensor("input_ids", ids) }))
             {
-                Tensor<float> pooled = null;
-                foreach (var o in outs) if (o.Name == "pooler_output") pooled = o.AsTensor<float>();
+                var pooled = (outs.FirstOrDefault(o => o.Name == "pooler_output") ?? outs.Last()).AsTensor<float>();
+                int dim = pooled.Dimensions[pooled.Dimensions.Length - 1];
                 for (int b = 0; b < n; b++)
                 {
-                    var e = new float[Analysis.SigDim];
-                    for (int i = 0; i < e.Length; i++) e[i] = pooled[b, i];
+                    var e = new float[dim];
+                    for (int i = 0; i < dim; i++) e[i] = pooled[b, i];
                     result[b] = Models.Normalise(e);
                 }
             }
@@ -207,6 +276,20 @@ namespace IdleTrim
                     rank++;
                 }
             }
+        }
+
+        // The fixed length the tokenizer pads to (SigLIP 2: 64), from tokenizer.json.
+        public static int FixedLength(string path, int fallback)
+        {
+            try
+            {
+                using (var doc = JsonDocument.Parse(File.ReadAllBytes(path)))
+                    if (doc.RootElement.TryGetProperty("padding", out var p) && p.ValueKind == JsonValueKind.Object &&
+                        p.TryGetProperty("strategy", out var st) && st.ValueKind == JsonValueKind.Object && st.TryGetProperty("Fixed", out var f))
+                        return f.GetInt32();
+            }
+            catch (Exception) { }
+            return fallback;
         }
 
         public int[] Encode(string text, int length)

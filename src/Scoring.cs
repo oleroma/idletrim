@@ -5,35 +5,49 @@ using System.Linq;
 
 namespace IdleTrim
 {
-    public enum Source { Siglip, Dino, Both }
-
     // A small logistic regression per model, trained on the keep/cut choices of every exported video.
     public class Learner
     {
         public const int MinPerClass = 40;   // half-second steps of each kind before a model counts as trained
 
-        public float[] SigW, DinoW;
-        public float SigB, DinoB;
-        public int Videos, Kept, Cut;
+        public class Head
+        {
+            public float[] W;
+            public float B;
+            public int Kept, Cut;
+        }
 
-        public bool Trained { get { return SigW != null && Kept >= MinPerClass && Cut >= MinPerClass; } }
+        public readonly Dictionary<string, Head> Heads = new Dictionary<string, Head>();
+        public int Videos;
+
+        public bool TrainedFor(string modelId)
+        {
+            Head h;
+            return modelId != null && Heads.TryGetValue(modelId, out h) && h.W != null && h.Kept >= MinPerClass && h.Cut >= MinPerClass;
+        }
+
+        public bool Trained { get { return Heads.Keys.Any(TrainedFor); } }
+        public int Kept { get { return Heads.Count == 0 ? 0 : Heads.Values.Max(h => h.Kept); } }
+        public int Cut { get { return Heads.Count == 0 ? 0 : Heads.Values.Max(h => h.Cut); } }
 
         static string Dir { get { return Path.Combine(Analysis.DataDir, "learn"); } }
 
-        // Saves one video's final keep/cut choice with its embeddings. A later export of the same video replaces it.
+        // Saves one video's final keep/cut choice with every model's features it has. A later export of the same video replaces it.
         public static void AddExample(Analysis a, bool[] keep)
         {
             Directory.CreateDirectory(Dir);
             string path = Path.Combine(Dir, a.Key + ".bin");
             using (var w = new BinaryWriter(File.Create(path + ".tmp")))
             {
-                w.Write("IdleTrimLearn1");
+                w.Write("IdleTrimLearn2");
                 w.Write(a.Count);
-                for (int i = 0; i < a.Count; i++)
+                for (int i = 0; i < a.Count; i++) w.Write(keep[i]);
+                w.Write(a.Features.Count);
+                foreach (var f in a.Features)
                 {
-                    w.Write(keep[i]);
-                    Analysis.WriteFloats(w, a.Siglip[i]);
-                    Analysis.WriteFloats(w, a.Dino[i]);
+                    w.Write(f.Key);
+                    w.Write(f.Value[0].Length);
+                    for (int i = 0; i < a.Count; i++) Analysis.WriteFloats(w, f.Value[i]);
                 }
             }
             File.Move(path + ".tmp", path, true);
@@ -46,10 +60,15 @@ namespace IdleTrim
 
         public static Learner Train()
         {
-            var labels = new List<bool>();
-            var sig = new List<float[]>();
-            var dn = new List<float[]>();
+            var labels = new Dictionary<string, List<bool>>();
+            var feats = new Dictionary<string, List<float[]>>();
             var l = new Learner();
+            Action<string, bool[], float[][]> add = (id, keep, f) =>
+            {
+                if (!labels.ContainsKey(id)) { labels[id] = new List<bool>(); feats[id] = new List<float[]>(); }
+                labels[id].AddRange(keep);
+                feats[id].AddRange(f);
+            };
             if (Directory.Exists(Dir))
             {
                 foreach (string file in Directory.GetFiles(Dir, "*.bin"))
@@ -58,25 +77,46 @@ namespace IdleTrim
                     {
                         using (var r = new BinaryReader(File.OpenRead(file)))
                         {
-                            if (r.ReadString() != "IdleTrimLearn1") continue;
+                            string format = r.ReadString();
                             int n = r.ReadInt32();
-                            for (int i = 0; i < n; i++)
+                            var keep = new bool[n];
+                            if (format == "IdleTrimLearn1")
                             {
-                                labels.Add(r.ReadBoolean());
-                                sig.Add(Analysis.ReadFloats(r, Analysis.SigDim));
-                                dn.Add(Analysis.ReadFloats(r, Analysis.DinoDim));
+                                // The first version: SigLIP 2 base and DINOv2 small features with each step.
+                                var sig = new float[n][];
+                                var dn = new float[n][];
+                                for (int i = 0; i < n; i++) { keep[i] = r.ReadBoolean(); sig[i] = Analysis.ReadFloats(r, 768); dn[i] = Analysis.ReadFloats(r, 384); }
+                                add(Catalog.SiglipBase, keep, sig);
+                                add(Catalog.DinoSmall, keep, dn);
                             }
+                            else if (format == "IdleTrimLearn2")
+                            {
+                                for (int i = 0; i < n; i++) keep[i] = r.ReadBoolean();
+                                int models = r.ReadInt32();
+                                for (int m = 0; m < models; m++)
+                                {
+                                    string id = r.ReadString();
+                                    int dim = r.ReadInt32();
+                                    var f = new float[n][];
+                                    for (int i = 0; i < n; i++) f[i] = Analysis.ReadFloats(r, dim);
+                                    add(id, keep, f);
+                                }
+                            }
+                            else continue;
                             l.Videos++;
                         }
                     }
                     catch (Exception) { }   // skip a damaged file
                 }
             }
-            l.Kept = labels.Count(x => x);
-            l.Cut = labels.Count - l.Kept;
-            if (l.Kept == 0 || l.Cut == 0) return l;
-            l.SigW = Fit(sig, labels, out l.SigB);
-            l.DinoW = Fit(dn, labels, out l.DinoB);
+            foreach (var id in labels.Keys)
+            {
+                var y = labels[id];
+                var h = new Head { Kept = y.Count(x => x) };
+                h.Cut = y.Count - h.Kept;
+                if (h.Kept > 0 && h.Cut > 0) h.W = Fit(feats[id], y, out h.B);
+                l.Heads[id] = h;
+            }
             return l;
         }
 
@@ -120,68 +160,73 @@ namespace IdleTrim
             return result;
         }
 
-        public float Prob(float[] weights, float bias, float[] x)
+        public float Prob(string modelId, float[] x)
         {
-            double z = bias + Models.Dot(weights, x);
+            var h = Heads[modelId];
+            double z = h.B + Models.Dot(h.W, x);
             return (float)(1 / (1 + Math.Exp(-z)));
         }
     }
 
     public static class Scoring
     {
-        // 0..1 per step, higher is more action. Untrained: SigLIP compares frames with the prompts, and DINOv2 learns
-        // from SigLIP's surest frames in this video. Both are scaled to the video's own range.
-        public static float[] Scores(Analysis a, Source source, Learner learner)
+        // 0..1 per step, higher is more action, from the chosen prompt and visual models (either may be null). Each model
+        // that has learned from your edits uses that. Otherwise the prompt model compares frames with the prompts, and the
+        // visual model learns from the prompt model's surest frames in this video. Null when there's nothing to go on yet:
+        // the video hasn't been through Detect with these models, or the prompts haven't been read by the prompt model.
+        public static float[] Scores(Analysis a, string promptModel, string visualModel, Learner learner)
         {
-            bool trained = learner != null && learner.Trained;
-            float[] sig = new float[a.Count], dn = new float[a.Count];
-            if (trained)
+            var parts = new List<float[]>();
+            float[][] pf = a.FeaturesOf(promptModel), vf = a.FeaturesOf(visualModel);
+            float[] zero = pf != null ? ZeroShot(a, promptModel) : null;
+            if (pf != null)
             {
-                for (int i = 0; i < a.Count; i++)
-                {
-                    sig[i] = learner.Prob(learner.SigW, learner.SigB, a.Siglip[i]);
-                    dn[i] = learner.Prob(learner.DinoW, learner.DinoB, a.Dino[i]);
-                }
+                if (learner != null && learner.TrainedFor(promptModel)) parts.Add(pf.Select(e => learner.Prob(promptModel, e)).ToArray());
+                else if (zero != null) parts.Add(Spread(zero));
             }
-            else
+            if (vf != null)
             {
-                sig = Spread(ZeroShot(a));
-                dn = Spread(DinoFromSiglip(a));
+                if (learner != null && learner.TrainedFor(visualModel)) parts.Add(vf.Select(e => learner.Prob(visualModel, e)).ToArray());
+                else if (zero != null) parts.Add(Spread(VisualFromPrompts(a, visualModel, zero)));
             }
-            float[] raw = new float[a.Count];
-            for (int i = 0; i < a.Count; i++)
-                raw[i] = source == Source.Siglip ? sig[i] : source == Source.Dino ? dn[i] : (sig[i] + dn[i]) / 2;
+            if (parts.Count == 0) return null;
+            var raw = new float[a.Count];
+            for (int i = 0; i < a.Count; i++) raw[i] = parts.Sum(p => p[i]) / parts.Count;
             return Smooth(raw, 2);
         }
 
-        // The current prompts' score for each step, from the cached image embeddings, so editing prompts needs no re-analysis.
-        static Analysis zeroFor;
-        static PromptSet zeroSet;
-        static float[] zeroCache;
+        // The prompts' score for each step, from the stored image features, so editing prompts needs no re-detecting.
+        // Null until the prompt model has read the current prompts.
+        static readonly Dictionary<string, Tuple<Analysis, int, float[]>> zeroCache = new Dictionary<string, Tuple<Analysis, int, float[]>>();
 
-        public static float[] ZeroShot(Analysis a)
+        public static float[] ZeroShot(Analysis a, string promptModel)
         {
-            var set = PromptSet.Current;
-            lock (typeof(Scoring))
+            var f = a.FeaturesOf(promptModel);
+            var e = f == null ? null : PromptSet.For(promptModel);
+            if (e == null) return null;
+            lock (zeroCache)
             {
-                if (zeroFor != a || zeroSet != set) { zeroCache = set.Scores(a); zeroFor = a; zeroSet = set; }
-                return zeroCache;
+                Tuple<Analysis, int, float[]> c;
+                if (zeroCache.TryGetValue(promptModel, out c) && c.Item1 == a && c.Item2 == PromptSet.Version) return c.Item3;
+                var r = e.Scores(f);
+                zeroCache[promptModel] = Tuple.Create(a, PromptSet.Version, r);
+                return r;
             }
         }
 
-        // DINOv2 has no text side, so until it has learned from you it learns from SigLIP: the quarter of this video's
-        // steps SigLIP is surest are action and the quarter it is surest are idle train a classifier on DINOv2's features,
-        // which then judges every step by what is on screen. Camera movement alone doesn't count as action.
-        static Analysis dinoFor;
-        static PromptSet dinoSet;
-        static float[] dinoCache;
+        // A visual model has no text side, so until it has learned from you it learns from the prompt model: the quarter of
+        // this video's steps the prompts rate highest are action and the lowest quarter idle, which train a classifier on the
+        // visual model's features; it then judges every step by what is on screen. Camera movement alone doesn't count.
+        static readonly Dictionary<string, Tuple<Analysis, float[], float[]>> visualCache = new Dictionary<string, Tuple<Analysis, float[], float[]>>();
 
-        public static float[] DinoFromSiglip(Analysis a)
+        public static float[] VisualFromPrompts(Analysis a, string visualModel, float[] zero)
         {
-            var set = PromptSet.Current;
-            lock (typeof(Scoring))
-                if (dinoFor == a && dinoSet == set) return dinoCache;
-            var zero = ZeroShot(a);
+            lock (visualCache)
+            {
+                Tuple<Analysis, float[], float[]> c;
+                if (visualCache.TryGetValue(visualModel, out c) && c.Item1 == a && c.Item2 == zero) return c.Item3;
+            }
+            var feats = a.FeaturesOf(visualModel);
             var result = new float[a.Count];
             if (a.Count >= 8)
             {
@@ -191,14 +236,14 @@ namespace IdleTrim
                 var y = new List<bool>();
                 for (int k = 0; k < q; k += stride)
                 {
-                    x.Add(a.Dino[order[a.Count - 1 - k]]); y.Add(true);
-                    x.Add(a.Dino[order[k]]); y.Add(false);
+                    x.Add(feats[order[a.Count - 1 - k]]); y.Add(true);
+                    x.Add(feats[order[k]]); y.Add(false);
                 }
                 float b;
                 var w = Learner.Fit(x, y, out b);
-                for (int i = 0; i < a.Count; i++) result[i] = b + Models.Dot(w, a.Dino[i]);
+                for (int i = 0; i < a.Count; i++) result[i] = b + Models.Dot(w, feats[i]);
             }
-            lock (typeof(Scoring)) { dinoCache = result; dinoFor = a; dinoSet = set; }
+            lock (visualCache) visualCache[visualModel] = Tuple.Create(a, zero, result);
             return result;
         }
 

@@ -32,7 +32,9 @@ namespace IdleTrim
 
         readonly Preview preview = new Preview { Dock = DockStyle.Fill, Margin = new Padding(0, 0, Theme.S(14), 0) };
         readonly Timeline timeline = new Timeline { Dock = DockStyle.Fill, Margin = new Padding(0, Theme.S(10), 0, Theme.S(10)) };
-        readonly Segmented model = new Segmented();
+        readonly Dropdown promptPick = new Dropdown(), visualPick = new Dropdown();
+        readonly Btn detect = new Btn("Detect action", true);
+        readonly Label detectInfo = Text0();
         readonly Slider sensitivity = Bar(), padding = Bar();
         readonly Label sensitivityValue = Text0(), paddingValue = Text0(), learnInfo = Text0(), keptInfo = Text0();
         readonly Toggle learn = new Toggle("Learn from my edits") { Checked = true };
@@ -51,7 +53,10 @@ namespace IdleTrim
         readonly System.Windows.Forms.Timer playTimer = new System.Windows.Forms.Timer { Interval = 15 };
         readonly System.Windows.Forms.Timer restartTimer = new System.Windows.Forms.Timer { Interval = 60 };
         Player player;
-        bool playing;   // Play is on; player can be null for a moment while it restarts after a seek or an edit
+        bool playing;
+        bool proxyReady;      // the video's small playback copy exists; playback and seeking use it
+        CancelFlag proxyJob;  // building that copy in the background
+   // Play is on; player can be null for a moment while it restarts after a seek or an edit
         Player warm;          // started at the playhead and waiting, so Play is instant
         string warmKey;
         readonly System.Windows.Forms.Timer warmTimer = new System.Windows.Forms.Timer { Interval = 120 };
@@ -75,7 +80,7 @@ namespace IdleTrim
         string lastOutput;
         VideoInfo video;
         Analysis analysis;
-        Models models;
+        bool embeddingPrompts;   // a prompt model is reading the prompts in the background
         Learner learner;
         float[] scores;
         bool[] keep;
@@ -99,7 +104,7 @@ namespace IdleTrim
         {
             startupFile = file;
             Text = "IdleTrim";
-            ClientSize = new Size(S(980), S(860));
+            ClientSize = new Size(S(1000), S(920));
             MinimumSize = new Size(S(820), S(760));
 
             var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, Padding = new Padding(S(18), S(16), S(18), S(16)), AutoScroll = true };
@@ -135,7 +140,7 @@ namespace IdleTrim
             grid.SetColumnSpan(card, 4);
 
             // Preview + detection
-            var top = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Height = S(300), Margin = new Padding(0) };
+            var top = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Height = S(360), Margin = new Padding(0) };
             top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
             top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
             top.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -196,10 +201,12 @@ namespace IdleTrim
             mute.CheckedChanged += (o, e) => { changed(o, e); RestartPlayback(); ScheduleWarm(); };
             encoder.SelectedIndexChanged += changed;
 
-            model.SelectedIndexChanged += (o, e) => { if (!updating) Rescore(); };
+            promptPick.SelectedIndexChanged += (o, e) => PickChanged(promptPick, ModelKind.Prompts);
+            visualPick.SelectedIndexChanged += (o, e) => PickChanged(visualPick, ModelKind.Visual);
+            detect.Click += (o, e) => Detect();
             sensitivity.Scroll += (o, e) => Rescore();
             padding.Scroll += (o, e) => Rescore();
-            timeline.PlayheadChanged += (o, e) => { ShowPlayhead(); RestartPlayback(); ScheduleWarm(); };
+            timeline.PlayheadChanged += (o, e) => { ShowPlayhead(); preview.Update(); RestartPlayback(); ScheduleWarm(); };
             timeline.RemoveRequested += RemovePart;
             timeline.RangeDragged += DragRange;
             timeline.UndoRequested += Undo;
@@ -212,7 +219,7 @@ namespace IdleTrim
             playAll.CheckedChanged += (o, e) => { RestartPlayback(); ScheduleWarm(); };
             playTimer.Tick += (o, e) => PlayTick();
             restartTimer.Tick += (o, e) => { if (timeline.Scrubbing) return; restartTimer.Stop(); if (playing) StartPlayback(); };
-            warmTimer.Tick += (o, e) => { warmTimer.Stop(); Warm(); };
+            warmTimer.Tick += (o, e) => { if (timeline.Scrubbing) return; warmTimer.Stop(); Warm(); };   // not while the mouse is still dragging
             forget.Click += (o, e) => ForgetLearning();
             promptsButton.Click += (o, e) => EditPrompts();
 
@@ -222,12 +229,16 @@ namespace IdleTrim
             showFile.Click += (o, e) => { if (lastOutput != null) Process.Start("explorer.exe", "/select,\"" + lastOutput + "\""); };
             AcceptDrops(this);
             Shown += (o, e) => { Retrain(); InitTools(); };
-            FormClosing += (o, e) => { StopPlayback(); DropWarm(); SaveSession(); if (cancel != null) cancel.Cancel(); };
+            FormClosing += (o, e) => { StopPlayback(); DropWarm(); if (proxyJob != null) proxyJob.Cancel(); SaveSession(); if (cancel != null) cancel.Cancel(); };
             ConfirmReplace = AskReplace;
+            ConfirmDownload = AskDownload;
 
             // Carry on where the last session left off.
             updating = true;
-            model.SelectedIndex = Math.Max(0, Math.Min(2, session.Model));
+            FillModels(promptPick, ModelKind.Prompts, session.PromptModel);
+            FillModels(visualPick, ModelKind.Visual, session.VisualModel);
+            lastPrompt = PromptModel;
+            lastVisual = VisualModel;
             sensitivity.Value = Math.Max(0, Math.Min(100, session.Sensitivity));
             padding.Value = Math.Max(0, Math.Min(40, session.Padding));
             learn.Checked = session.Learn;
@@ -248,7 +259,8 @@ namespace IdleTrim
         void SaveSession()
         {
             SaveEdits();
-            session.Model = model.SelectedIndex;
+            session.PromptModel = PromptModel;
+            session.VisualModel = VisualModel;
             session.Sensitivity = sensitivity.Value;
             session.Padding = padding.Value;
             session.Learn = learn.Checked;
@@ -318,7 +330,7 @@ namespace IdleTrim
             playAll.Anchor = AnchorStyles.Left;
             playAll.Margin = new Padding(S(12), 0, 0, 0);
             p.Controls.Add(playAll, 1, 1);
-            hint.Text = "Drag band to add · right-click removes · Ctrl+Z undo";
+            hint.Text = "Drag band to add · double-click splits · right-click removes";
             hint.ForeColor = Theme.Faint;
             hint.AutoEllipsis = true;
             hint.AutoSize = false;
@@ -336,37 +348,47 @@ namespace IdleTrim
             p.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             p.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, S(60)));
 
-            model.Items.Add("SigLIP 2");
-            model.Items.Add("DINOv2");
-            model.Items.Add("Both");
-            model.SelectedIndex = 2;
-            model.Dock = DockStyle.Fill;
-            model.Height = S(34);
-            model.Margin = new Padding(S(10), S(4), 0, S(4));
-            p.Controls.Add(Dim("Detection"), 0, 0);
-            p.Controls.Add(model, 1, 0);
-            p.SetColumnSpan(model, 2);
+            foreach (var pick in new[] { promptPick, visualPick })
+            {
+                pick.Dock = DockStyle.Fill;
+                pick.Margin = new Padding(S(10), S(3), 0, S(3));
+            }
+            p.Controls.Add(Dim("Prompt model"), 0, 0);
+            p.Controls.Add(promptPick, 1, 0);
+            p.SetColumnSpan(promptPick, 2);
+            p.Controls.Add(Dim("Visual model"), 0, 1);
+            p.Controls.Add(visualPick, 1, 1);
+            p.SetColumnSpan(visualPick, 2);
+            var detectRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, S(6), 0, S(6)), WrapContents = false };
+            detect.Margin = new Padding(0, 0, S(10), 0);
+            detectRow.Controls.Add(detect);
+            detectInfo.ForeColor = Theme.Dim;
+            detectInfo.MaximumSize = new Size(S(250), 0);
+            detectInfo.Anchor = AnchorStyles.Left;
+            detectRow.Controls.Add(detectInfo);
+            p.Controls.Add(detectRow, 0, 2);
+            p.SetColumnSpan(detectRow, 3);
 
             sensitivity.SetRange(0, 100);
             sensitivity.Value = 50;
-            p.Controls.Add(Dim("Sensitivity"), 0, 1);
-            p.Controls.Add(sensitivity, 1, 1);
-            p.Controls.Add(sensitivityValue, 2, 1);
+            p.Controls.Add(Dim("Sensitivity"), 0, 3);
+            p.Controls.Add(sensitivity, 1, 3);
+            p.Controls.Add(sensitivityValue, 2, 3);
 
             padding.SetRange(0, 40);
             padding.Value = 15;
             padding.LargeChange = 5;
-            p.Controls.Add(Dim("Padding"), 0, 2);
-            p.Controls.Add(padding, 1, 2);
-            p.Controls.Add(paddingValue, 2, 2);
+            p.Controls.Add(Dim("Padding"), 0, 4);
+            p.Controls.Add(padding, 1, 4);
+            p.Controls.Add(paddingValue, 2, 4);
 
-            learn.Margin = new Padding(0, S(8), 0, S(4));
-            p.Controls.Add(learn, 0, 3);
+            learn.Margin = new Padding(0, S(4), 0, S(2));
+            p.Controls.Add(learn, 0, 5);
             p.SetColumnSpan(learn, 3);
             learnInfo.ForeColor = Theme.Dim;
             learnInfo.MaximumSize = new Size(S(360), 0);
             learnInfo.Margin = new Padding(0, S(2), 0, S(6));
-            p.Controls.Add(learnInfo, 0, 4);
+            p.Controls.Add(learnInfo, 0, 6);
             p.SetColumnSpan(learnInfo, 3);
             var row = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0), WrapContents = false };
             promptsButton.Margin = new Padding(0, 0, S(8), 0);
@@ -375,18 +397,18 @@ namespace IdleTrim
             row.Controls.Add(forget);
             resetEdits.Margin = new Padding(S(8), 0, 0, 0);
             row.Controls.Add(resetEdits);
-            p.Controls.Add(row, 0, 5);
+            p.Controls.Add(row, 0, 7);
             p.SetColumnSpan(row, 3);
 
             keptInfo.Font = new Font("Segoe UI Semibold", 10f);
-            keptInfo.Margin = new Padding(0, S(12), 0, 0);
+            keptInfo.Margin = new Padding(0, S(8), 0, 0);
             keptInfo.MaximumSize = new Size(S(360), 0);
-            p.Controls.Add(keptInfo, 0, 6);
+            p.Controls.Add(keptInfo, 0, 8);
             p.SetColumnSpan(keptInfo, 3);
 
-            for (int i = 0; i < 7; i++) p.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            for (int i = 0; i < 9; i++) p.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             p.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            p.RowCount = 8;
+            p.RowCount = 10;
             return p;
         }
 
@@ -551,10 +573,10 @@ namespace IdleTrim
         {
             if (learner == null) { learnInfo.Text = "Loading what it has learned..."; return; }
             if (learner.Trained)
-                learnInfo.Text = string.Format("Learned from {0} video{1} ({2} of action, {3} idle). Both models use what they learned.",
+                learnInfo.Text = string.Format("Learned from {0} video{1} ({2} of action, {3} idle). The models you exported with use what they learned.",
                     learner.Videos, learner.Videos == 1 ? "" : "s", Time(learner.Kept * Analysis.Step), Time(learner.Cut * Analysis.Step));
             else
-                learnInfo.Text = string.Format("Not trained yet: SigLIP 2 judges frames with {0}, and DINOv2 learns from SigLIP's surest frames. Fix the timeline and export a few videos to teach both.",
+                learnInfo.Text = string.Format("Not trained yet: the prompt model judges frames with {0}, and the visual model learns from its surest frames. Fix the timeline and export a few videos to teach them.",
                     PromptSet.Current.Custom ? "your prompts" : "the built-in prompts");
             forget.Enabled = !busy && learner.Videos > 0;
         }
@@ -572,10 +594,11 @@ namespace IdleTrim
             }
         }
 
-        // Embeds only the prompts that are new, then rescores from the cached frames: no re-analysis needed.
+        // New texts are saved; the chosen prompt model reads them, and the scores update from the stored features.
         void ApplyPrompts(List<string> action, List<string> idle, Action<string> done)
         {
-            var builtIn = PromptSet.BuiltIn();
+            PromptSet.SetTexts(action, idle);
+            var model = Catalog.Find(PromptModel);
             Action<string> finish = error =>
             {
                 if (error == null) status.Text = PromptSet.Current.Custom ? "Using your prompts." : "Using the built-in prompts.";
@@ -583,56 +606,180 @@ namespace IdleTrim
                 Rescore();
                 if (done != null) done(error);
             };
-            if (action.SequenceEqual(builtIn.Action) && idle.SequenceEqual(builtIn.Idle)) { PromptSet.Reset(); finish(null); return; }
-
-            var known = new Dictionary<string, float[]>();
-            foreach (var set in new[] { builtIn, PromptSet.Current })
+            if (model == null || !model.Present() || PromptSet.For(model.Id) != null) { finish(null); return; }
+            RunBusy("Reading the prompts with " + model.Name, (flag, report) =>
             {
-                for (int i = 0; i < set.Action.Count; i++) known[set.Action[i]] = set.ActionEmb[i];
-                for (int i = 0; i < set.Idle.Count; i++) known[set.Idle[i]] = set.IdleEmb[i];
-            }
-            var missing = action.Concat(idle).Where(t => !known.ContainsKey(t)).Distinct().ToList();
-            Action save = () =>
-            {
-                var set = new PromptSet();
-                foreach (var t in action) { set.Action.Add(t); set.ActionEmb.Add(known[t]); }
-                foreach (var t in idle) { set.Idle.Add(t); set.IdleEmb.Add(known[t]); }
-                PromptSet.Save(set);
-            };
-            if (missing.Count == 0) { save(); finish(null); return; }
-
-            if (!TextEncoder.Present())
-            {
-                bool download = ThemedDialog.Ask(this, "Text model needed", new string[,]
-                {
-                    { null, "New prompts are read by SigLIP 2's text half, which IdleTrim only needs while you edit them." },
-                    { "Size", "about 600 MB, from Hugging Face" },
-                    { null, "Download it into the models folder next to this app?" }
-                }, "Download", "Not now");
-                if (!download) { status.Text = "Prompts not changed: the text model is needed to read new ones."; if (done != null) done("no text model"); return; }
-                RunBusy("Downloading the text model", (flag, report) => TextEncoder.Download((pct, name) => report(pct / 100.0, "Downloading " + name), flag), error =>
-                {
-                    if (error != null) { status.Text = "Couldn't download the text model: " + error; if (done != null) done(error); return; }
-                    ApplyPrompts(action, idle, done);
-                });
-                return;
-            }
-
-            RunBusy("Reading the prompts", (flag, report) =>
-            {
-                report(0, "Loading the text model");
-                using (var enc = new TextEncoder())
-                {
-                    var embs = enc.Embed(missing);
-                    for (int i = 0; i < missing.Count; i++) known[missing[i]] = embs[i];
-                }
-                save();
+                report(0, "Reading the prompts with " + model.Name);
+                PromptSet.Embed(model);
             }, error =>
             {
                 if (error != null) status.Text = "Couldn't read the prompts: " + error;
                 progress.Value = 0;
                 finish(error);
             });
+        }
+
+        // ---- models ----
+
+        class ModelItem
+        {
+            public ModelInfo Info;      // null: None
+            public bool Add;            // "Add from Hugging Face..."
+            public override string ToString()
+            {
+                if (Add) return "Add from Hugging Face...";
+                if (Info == null) return "None";
+                return Info.Name + "  ·  " + (Info.Present() ? "downloaded" : Info.SizeText);
+            }
+        }
+
+        string PromptModel { get { var i = promptPick.SelectedItem as ModelItem; return i != null && i.Info != null ? i.Info.Id : null; } }
+        string VisualModel { get { var i = visualPick.SelectedItem as ModelItem; return i != null && i.Info != null ? i.Info.Id : null; } }
+
+        void FillModels(Dropdown pick, ModelKind kind, string selectId)
+        {
+            updating = true;
+            pick.Items.Clear();
+            pick.Items.Add(new ModelItem());
+            foreach (var m in Catalog.All(kind)) pick.Items.Add(new ModelItem { Info = m });
+            pick.Items.Add(new ModelItem { Add = true });
+            int index = 0;
+            for (int i = 0; i < pick.Items.Count; i++)
+            {
+                var it = (ModelItem)pick.Items[i];
+                if (it.Info != null && it.Info.Id == selectId) index = i;
+            }
+            pick.SelectedIndex = index;
+            updating = false;
+        }
+
+        string lastPrompt, lastVisual;
+
+        void PickChanged(Dropdown pick, ModelKind kind)
+        {
+            if (updating) return;
+            var item = pick.SelectedItem as ModelItem;
+            if (item != null && item.Add)
+            {
+                string back = kind == ModelKind.Prompts ? lastPrompt : lastVisual;
+                FillModels(pick, kind, back);
+                AddModel(pick, kind);
+                return;
+            }
+            if (kind == ModelKind.Prompts) lastPrompt = PromptModel; else lastVisual = VisualModel;
+            Rescore();
+        }
+
+        // Adds a model by its Hugging Face repo id (a SigLIP or DINOv2 model in ONNX form).
+        void AddModel(Dropdown pick, ModelKind kind)
+        {
+            string repo;
+            using (var d = new InputDialog("Add a model", "Hugging Face repo id of an ONNX SigLIP (prompt) or DINOv2 (visual) model, for example onnx-community/siglip2-base-patch16-512-ONNX:", "Add"))
+            {
+                if (d.ShowDialog(this) != DialogResult.OK || d.Box.Text.Trim().Length == 0) return;
+                repo = d.Box.Text.Trim();
+            }
+            ModelInfo added = null;
+            RunBusy("Looking up " + repo, (flag, report) => { added = Catalog.AddFromHub(repo); }, error =>
+            {
+                progress.Value = 0;
+                if (error != null) { status.Text = "Couldn't add the model: " + error; return; }
+                var target = added.Kind == ModelKind.Prompts ? promptPick : visualPick;
+                FillModels(promptPick, ModelKind.Prompts, added.Kind == ModelKind.Prompts ? added.Id : PromptModel);
+                FillModels(visualPick, ModelKind.Visual, added.Kind == ModelKind.Visual ? added.Id : VisualModel);
+                lastPrompt = PromptModel;
+                lastVisual = VisualModel;
+                status.Text = string.Format("Added {0} as a {1} model ({2}). Detect action downloads it.", added.Name, added.Kind == ModelKind.Prompts ? "prompt" : "visual", added.SizeText);
+                Rescore();
+            });
+        }
+
+        List<ModelInfo> ChosenModels()
+        {
+            var list = new List<ModelInfo>();
+            foreach (var id in new[] { PromptModel, VisualModel })
+            {
+                var m = Catalog.Find(id);
+                if (m != null) list.Add(m);
+            }
+            return list;
+        }
+
+        // Asked before a download; tests swap it out.
+        internal Func<List<ModelInfo>, bool> ConfirmDownload;
+
+        bool AskDownload(List<ModelInfo> missing)
+        {
+            var rows = new string[missing.Count + 2, 2];
+            rows[0, 0] = null;
+            rows[0, 1] = "Detect action needs these models, from Hugging Face:";
+            for (int i = 0; i < missing.Count; i++) { rows[i + 1, 0] = missing[i].Name; rows[i + 1, 1] = missing[i].SizeText + ". " + missing[i].Note; }
+            rows[missing.Count + 1, 0] = null;
+            rows[missing.Count + 1, 1] = "Download them into the models folder next to this app?";
+            return ThemedDialog.Ask(this, "Models needed", rows, "Download", "Not now");
+        }
+
+        // Runs the chosen models over the video (two frames a second, from the small proxy) and scores it.
+        void Detect()
+        {
+            if (busy || analysis == null || video == null) return;
+            var chosen = ChosenModels();
+            if (chosen.Count == 0) { status.Text = "Choose a prompt or visual model first."; return; }
+            var missing = chosen.Where(m => !m.Present()).ToList();
+            if (missing.Count > 0)
+            {
+                if (!ConfirmDownload(missing)) { status.Text = "The models are needed to detect action."; return; }
+                RunBusy("Downloading", (flag, report) =>
+                {
+                    foreach (var m in missing) m.Download((pct, name) => report(pct / 100.0, "Downloading " + name), flag);
+                }, error =>
+                {
+                    progress.Value = 0;
+                    FillModels(promptPick, ModelKind.Prompts, PromptModel);
+                    FillModels(visualPick, ModelKind.Visual, VisualModel);
+                    if (error != null) { status.Text = "Couldn't download the models: " + error; return; }
+                    Detect();
+                });
+                return;
+            }
+            StopPlayback();
+            var a = analysis;
+            var todo = chosen.Where(m => a.FeaturesOf(m.Id) == null).ToList();
+            var prompt = Catalog.Find(PromptModel);
+            string source = proxyReady ? Proxy.PathFor(a.Key) : video.Path;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            RunBusy("Detecting", (flag, report) =>
+            {
+                Detector.Run(ffmpeg, a, source, todo, report, flag);
+                if (prompt != null && PromptSet.For(prompt.Id) == null)
+                {
+                    report(1, "Reading the prompts with " + prompt.Name);
+                    PromptSet.Embed(prompt);
+                }
+            }, error =>
+            {
+                progress.Value = 0;
+                if (error != null) { status.Text = "Couldn't detect: " + error.Replace('\n', ' '); return; }
+                if (analysis != a) return;
+                status.Text = string.Format("Detected with {0} in {1:0}s.", string.Join(" and ", chosen.Select(m => m.Name)), sw.Elapsed.TotalSeconds);
+                Rescore();
+            });
+        }
+
+        // A prompt model whose features exist but that hasn't read the current prompts yet (after editing them, or
+        // switching models): read them in the background, then score again.
+        void EnsurePrompts()
+        {
+            var model = Catalog.Find(PromptModel);
+            if (embeddingPrompts || model == null || analysis == null || analysis.FeaturesOf(model.Id) == null || !model.Present() || PromptSet.For(model.Id) != null) return;
+            embeddingPrompts = true;
+            var worker = new Thread(() =>
+            {
+                try { PromptSet.Embed(model); } catch (Exception) { }
+                Ui(() => { embeddingPrompts = false; Rescore(); });
+            });
+            worker.IsBackground = true;
+            worker.Start();
         }
 
         void ForgetLearning()
@@ -662,6 +809,8 @@ namespace IdleTrim
             StopPlayback();
             DropWarm();
             SaveEdits();
+            if (proxyJob != null) { proxyJob.Cancel(); proxyJob = null; }
+            proxyReady = false;
             if (restore != null && !string.Equals(restore.Video, path, StringComparison.OrdinalIgnoreCase)) restore = null;
             try
             {
@@ -693,48 +842,27 @@ namespace IdleTrim
             SetAnalysis(null);
 
             var cached = Analysis.Load(Analysis.KeyFor(path));
-            if (cached != null) { SetAnalysis(cached); status.Text = "Loaded the earlier analysis of this video."; return; }
-            Analyze();
+            if (cached != null) { SetAnalysis(cached); status.Text = "Opened " + Path.GetFileName(path) + "."; return; }
+            Index();
         }
 
-        void Analyze()
+        // Opening a new video: thumbnails, motion and the playback proxy from one quick decode. No AI.
+        void Index()
         {
-            if (!Models.Present())
-            {
-                bool download = ThemedDialog.Ask(this, "Models needed", new string[,]
-                {
-                    { null, "IdleTrim finds action with two image models that run on your PC:" },
-                    { "SigLIP 2", "Google, Apache 2.0, 178 MB" },
-                    { "DINOv2", "Meta, Apache 2.0, 85 MB" },
-                    { null, "Download them from Hugging Face into a folder next to this app?" }
-                }, "Download", "Not now");
-                if (!download) { status.Text = "The models are needed to find the action."; return; }
-                RunBusy("Downloading models", (flag, report) => Models.Download((p, name) => report(p / 100.0, "Downloading " + name), flag), error =>
-                {
-                    if (error != null) { status.Text = "Couldn't download the models: " + error; return; }
-                    Analyze();
-                });
-                return;
-            }
-
             var source = video;
             Analysis result = null;
-            RunBusy("Finding the action", (flag, report) =>
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            RunBusy("Preparing the timeline", (flag, report) =>
             {
-                if (models == null)
-                {
-                    report(0, "Loading models");
-                    models = new Models();
-                }
-                result = Analyzer.Run(ffmpeg, source, models, f => report(f, "Finding the action"), flag);
+                result = Indexer.Run(ffmpeg, source, f => report(f, "Preparing the timeline"), flag);
                 result.Save();
             }, error =>
             {
-                if (error != null) { status.Text = "Couldn't analyse the video: " + error.Replace('\n', ' '); return; }
+                progress.Value = 0;
+                if (error != null) { status.Text = "Couldn't read the video: " + error.Replace('\n', ' '); return; }
                 if (video != source) return;
                 SetAnalysis(result);
-                status.Text = string.Format("Analysed {0} on the {1}.", Time(result.Duration), models.OnGpu ? "GPU" : "CPU");
-                progress.Value = 0;
+                status.Text = string.Format("Ready in {0:0}s. Everything is kept: cut what you don't want, or Detect action.", sw.Elapsed.TotalSeconds);
             });
         }
 
@@ -748,6 +876,8 @@ namespace IdleTrim
             HashSet<int> savedSplits;
             if (a != null && Edits.Load(a.Key, a.Count, out savedOverrides, out savedSplits)) { overrides = savedOverrides; splits = savedSplits; }
             timeline.SetAnalysis(a);
+            proxyReady = a != null && Proxy.Ready(a.Key);
+            if (a != null && !proxyReady) StartProxy();
             Rescore();
             if (a != null && restore != null)
             {
@@ -779,9 +909,16 @@ namespace IdleTrim
                 Recalculate();
                 return;
             }
-            var source = model.SelectedIndex == 0 ? Source.Siglip : model.SelectedIndex == 1 ? Source.Dino : Source.Both;
-            scores = Scoring.Scores(analysis, source, learner);
-            keep = Scoring.Mask(scores, Threshold, PadSeconds, overrides);
+            scores = Scoring.Scores(analysis, PromptModel, VisualModel, learner);
+            if (scores != null) keep = Scoring.Mask(scores, Threshold, PadSeconds, overrides);
+            else
+            {
+                // Nothing detected yet: everything is kept, apart from what you cut by hand.
+                keep = new bool[analysis.Count];
+                for (int i = 0; i < keep.Length; i++) keep[i] = overrides[i] >= 0;
+                EnsurePrompts();
+            }
+            UpdateDetectInfo();
             segments = Scoring.Segments(keep, analysis.Duration);
             timeline.SetResult(scores, keep, overrides, splits, Threshold);
             double kept = Segment.Total(segments);
@@ -792,6 +929,16 @@ namespace IdleTrim
             Recalculate();
             RestartPlayback();
             ScheduleWarm();
+        }
+
+        void UpdateDetectInfo()
+        {
+            if (analysis == null) { detectInfo.Text = ""; return; }
+            var chosen = ChosenModels();
+            if (chosen.Count == 0) detectInfo.Text = "No model chosen: everything is kept until you cut it.";
+            else if (chosen.Any(m => analysis.FeaturesOf(m.Id) == null)) detectInfo.Text = "Not detected yet: everything is kept until you Detect or cut it.";
+            else if (scores == null) detectInfo.Text = embeddingPrompts ? "Reading the prompts..." : "Detected; choose a prompt model or teach the visual one.";
+            else detectInfo.Text = "Detected with " + string.Join(" + ", chosen.Select(m => m.Name.Split(',')[0])) + ".";
         }
 
         // ---- editing; every change can be undone with Ctrl+Z ----
@@ -861,6 +1008,7 @@ namespace IdleTrim
         void Split(int step)
         {
             if (analysis == null || busy || step <= 0 || step >= analysis.Count) return;
+            if (!splits.Contains(step) && !(keep[step - 1] && keep[step])) return;   // only inside a kept part
             PushUndo();
             if (!splits.Remove(step)) splits.Add(step);
             Rescore();
@@ -876,15 +1024,45 @@ namespace IdleTrim
             Rescore();
         }
 
-        // Moving the edge at `boundary` to `to` gives the steps it passes over to the side that grows.
-        void DragEdge(int boundary, int to, bool leftKept, bool begin)
+        // Dragging one edge of the kept part [start, end) to `to`. Growing keeps the steps it passes over and, where it runs
+        // into the next kept part, moves the split between them; shrinking cuts them. Always measured from where the drag began.
+        bool[] keepBase;
+        void DragEdge(int start, int end, bool right, int to, bool begin)
         {
             if (analysis == null || busy) return;
-            if (begin || dragBase == null) { PushUndo(); dragBase = (sbyte[])overrides.Clone(); }
+            if (begin || dragBase == null)
+            {
+                PushUndo();
+                dragBase = (sbyte[])overrides.Clone();
+                splitBase = new HashSet<int>(splits);
+                keepBase = (bool[])keep.Clone();
+            }
             Array.Copy(dragBase, overrides, overrides.Length);
-            sbyte left = leftKept ? (sbyte)1 : (sbyte)-1;
-            if (to > boundary) for (int i = boundary; i < to; i++) overrides[i] = left;
-            else for (int i = to; i < boundary; i++) overrides[i] = (sbyte)-left;
+            splits = new HashSet<int>(splitBase);
+            int n = overrides.Length;
+            int from = right ? end : start;
+            if (right && to > from)
+            {
+                for (int i = from; i < to; i++) overrides[i] = 1;
+                splits.RemoveWhere(sp => sp >= from && sp <= to);
+                if (to < n && keepBase[to]) splits.Add(to);   // still touching the next part: keep them apart
+            }
+            else if (right && to < from)
+            {
+                for (int i = to; i < from; i++) overrides[i] = -1;
+                splits.Remove(from);
+            }
+            else if (!right && to < from)
+            {
+                for (int i = to; i < from; i++) overrides[i] = 1;
+                splits.RemoveWhere(sp => sp >= to && sp <= from);
+                if (to > 0 && keepBase[to - 1]) splits.Add(to);
+            }
+            else if (!right && to > from)
+            {
+                for (int i = from; i < to; i++) overrides[i] = -1;
+                splits.Remove(from);
+            }
             Rescore();
         }
 
@@ -911,11 +1089,48 @@ namespace IdleTrim
             return list;
         }
 
+        // The file playback decodes: the small proxy once it exists, the original until then.
+        string PlaySource { get { return proxyReady && analysis != null ? Proxy.PathFor(analysis.Key) : null; } }
+
+        // For videos analysed before proxies existed: builds one in the background, at low priority.
+        void StartProxy()
+        {
+            if (proxyJob != null || ffmpeg == null) return;
+            var flag = new CancelFlag();
+            proxyJob = flag;
+            var v = video;
+            string key = analysis.Key;
+            var worker = new Thread(() =>
+            {
+                string error = null;
+                try
+                {
+                    Proxy.Build(ffmpeg, v, key, f => Ui(() =>
+                    {
+                        if (proxyJob == flag && !busy) status.Text = string.Format("Making a small preview copy so seeking is quick... {0:0}%", f * 100);
+                    }), flag);
+                }
+                catch (CancelledException) { error = "cancelled"; }
+                catch (Exception ex) { error = ex.Message; }
+                Ui(() =>
+                {
+                    if (proxyJob != flag) return;
+                    proxyJob = null;
+                    if (error != null || video != v) return;
+                    proxyReady = true;
+                    if (!busy) status.Text = "Preview copy ready: seeking is quick now.";
+                    if (!playing) { DropWarm(); ScheduleWarm(); }
+                });
+            });
+            worker.IsBackground = true;
+            worker.Start();
+        }
+
         // What a player started now would play; a warm player is used only if this hasn't changed.
         string PlayKey()
         {
             var sb = new System.Text.StringBuilder();
-            sb.AppendFormat(CultureInfo.InvariantCulture, "{0}|{1:0.###}|{2}|{3}", video.Path, timeline.Playhead, playAll.Checked, mute.Checked);
+            sb.AppendFormat(CultureInfo.InvariantCulture, "{0}|{1}|{2:0.###}|{3}|{4}", video.Path, PlaySource, timeline.Playhead, playAll.Checked, mute.Checked);
             foreach (var seg in segments) sb.AppendFormat(CultureInfo.InvariantCulture, "|{0:0.###}-{1:0.###}", seg.Start, seg.End);
             return sb.ToString();
         }
@@ -935,7 +1150,7 @@ namespace IdleTrim
             DropWarm();
             var parts = PlayParts(timeline.Playhead);
             if (parts.Count == 0) return;
-            warm = new Player(ffmpeg, video, parts, !mute.Checked, false);
+            warm = new Player(ffmpeg, video, parts, !mute.Checked, false, PlaySource);
             warm.Start();
             warmKey = key;
         }
@@ -963,7 +1178,7 @@ namespace IdleTrim
                 var parts = PlayParts(timeline.Playhead);
                 if (parts.Count == 0) { timeline.Playhead = 0; parts = PlayParts(0); }
                 if (parts.Count == 0) { status.Text = "Nothing kept to play."; playing = false; play.Text = "Play"; return; }
-                player = new Player(ffmpeg, video, parts, !mute.Checked);
+                player = new Player(ffmpeg, video, parts, !mute.Checked, true, PlaySource);
                 player.Start();
             }
             playing = true;
@@ -1126,7 +1341,9 @@ namespace IdleTrim
             bool encode = canExport && !CopyOn;
             browse.Enabled = !busy;
             play.Enabled = ready && segments.Count > 0 || playing;
-            model.Enabled = sensitivity.Enabled = padding.Enabled = ready;
+            promptPick.Enabled = visualPick.Enabled = !busy;
+            detect.Enabled = ready && (PromptModel != null || VisualModel != null);
+            sensitivity.Enabled = padding.Enabled = ready && scores != null;
             timeline.Enabled = ready;
             learn.Enabled = !busy;
             forget.Enabled = !busy && learner != null && learner.Videos > 0;
@@ -1177,7 +1394,7 @@ namespace IdleTrim
                 status.Text = string.Format("Done: {0} of action, {1} (was {2}).", Time(runPlan.Kept), SizeText(size), SizeText(source.SizeBytes));
                 if (teach)
                 {
-                    try { Learner.AddExample(learned, choice); Retrain(); }
+                    try { if (learned.Features.Count > 0) { Learner.AddExample(learned, choice); Retrain(); } }
                     catch (Exception ex) { status.Text += " Couldn't save what it learned: " + ex.Message; }
                 }
             });

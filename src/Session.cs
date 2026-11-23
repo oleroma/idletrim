@@ -13,7 +13,8 @@ namespace IdleTrim
         public double ViewStart { get; set; }
         public double ViewLength { get; set; }
 
-        public int Model { get; set; } = 2;
+        public string PromptModel { get; set; } = Catalog.SiglipBase;
+        public string VisualModel { get; set; } = Catalog.DinoSmall;
         public int Sensitivity { get; set; } = 50;
         public int Padding { get; set; } = 15;
         public bool Learn { get; set; } = true;

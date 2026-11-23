@@ -36,7 +36,11 @@ namespace IdleTrim
                 string ff = Engine.FindTool("ffmpeg");
                 var pv = Engine.Probe(Engine.FindTool("ffprobe"), args[0]);
                 PlayerTest(ff, pv, null);
-                PlayerTest(ff, pv, null);
+                string px = Proxy.PathFor(Analysis.KeyFor(args[0]));
+                Environment.SetEnvironmentVariable("IDLETRIM_DATA", Path.Combine(args[1], "data"));
+                px = Proxy.PathFor(Analysis.KeyFor(args[0]));
+                if (!File.Exists(px)) Proxy.Build(ff, pv, Analysis.KeyFor(args[0]), f => { }, new CancelFlag());
+                PlayerTest(ff, pv, px);
             }
             else if (args.Length >= 3 && args[2] == "window")
             {
@@ -98,68 +102,102 @@ namespace IdleTrim
         {
             string ffmpeg = Engine.FindTool("ffmpeg"), ffprobe = Engine.FindTool("ffprobe");
             var v = Engine.Probe(ffprobe, path);
-            Check(Models.Present(), "models found in " + Models.Dir);
-            if (!Models.Present()) return;
+            var sigBase = Catalog.Find(Catalog.SiglipBase);
+            var dinoSmall = Catalog.Find(Catalog.DinoSmall);
+            Check(sigBase.Present() && dinoSmall.Present(), "models found in " + Models.Dir);
+            if (!sigBase.Present() || !dinoSmall.Present()) return;
 
-            TextTest();
+            TextTest(sigBase);
+            OldDataTest();
+            CatalogTest();
 
+            // Opening a video: an index with no AI, quick.
             var sw = Stopwatch.StartNew();
-            var models = new Models();
-            Console.WriteLine(string.Format("models loaded on {0} in {1:0.0}s", models.OnGpu ? "GPU" : "CPU", sw.Elapsed.TotalSeconds));
-            Check(models.OnGpu, "models run on the GPU");
-
-            sw.Restart();
-            var a = Analyzer.Run(ffmpeg, v, models, f => { }, new CancelFlag());
+            var a = Indexer.Run(ffmpeg, v, f => { }, new CancelFlag());
             double took = sw.Elapsed.TotalSeconds;
-            Console.WriteLine(string.Format("analysed {0:0.0}s of video in {1:0.0}s ({2:0.0}x real time), {3} steps", v.Duration, took, v.Duration / took, a.Count));
+            a.Save();   // as the window does
+            Console.WriteLine(string.Format("indexed {0:0.0}s of video in {1:0.0}s ({2:0.0}x real time), {3} steps, no AI", v.Duration, took, v.Duration / took, a.Count));
             Check(Math.Abs(a.Count - v.Duration / Analysis.Step) <= 2, "one step per half second");
-            Check(a.Siglip.All(e => Math.Abs(Models.Dot(e, e) - 1) < 1e-3) && a.Dino.All(e => Math.Abs(Models.Dot(e, e) - 1) < 1e-3), "embeddings are unit length");
-            Check(a.ZeroShot.Max() - a.ZeroShot.Min() > 0.02, "zero-shot score varies: " + a.ZeroShot.Min().ToString("0.000") + ".." + a.ZeroShot.Max().ToString("0.000"));
+            Check(a.Features.Count == 0, "opening a video runs no models");
             Check(a.Motion.Max() > 0, "motion measured");
+
+            // The same decode wrote the playback proxy: small, same length, audio, a keyframe at least every half second.
+            string proxy = Proxy.PathFor(a.Key);
+            Check(File.Exists(proxy), "indexing writes the playback proxy");
+            if (File.Exists(proxy))
+            {
+                var pi = Engine.Probe(ffprobe, proxy);
+                var psi = new ProcessStartInfo(ffprobe, "-v error -select_streams v:0 -skip_frame nokey -show_entries frame=pts_time -of csv=p=0 \"" + proxy + "\"")
+                { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true };
+                var keys = new List<double>();
+                using (var pr = Process.Start(psi))
+                    foreach (var line in pr.StandardOutput.ReadToEnd().Split('\n'))
+                    { double kt; if (double.TryParse(line.Trim().TrimEnd(','), NumberStyles.Float, CultureInfo.InvariantCulture, out kt)) keys.Add(kt); }
+                double gap = keys.Count > 1 ? keys.Zip(keys.Skip(1), (x, y) => y - x).Max() : 999;
+                Console.WriteLine(string.Format("proxy: {0}x{1}, {2:0.0}s, {3:0.0} MB, audio={4}, keyframes up to {5:0.00}s apart", pi.Width, pi.Height, pi.Duration, new FileInfo(proxy).Length / 1048576.0, pi.HasAudio, gap));
+                Check(pi.Width == Proxy.W && pi.Height == Proxy.H && Math.Abs(pi.Duration - v.Duration) < 0.3 && pi.HasAudio == v.HasAudio, "proxy is 640x360 with the same length and audio");
+                Check(gap <= 0.51, "proxy has a keyframe every half second");
+            }
             using (var ms = new MemoryStream(a.Previews[a.Count / 2]))
             using (var img = new Bitmap(ms))
                 Check(img.Width == 320 && img.Height == 180, "preview frames decode");
-            File.WriteAllLines(Path.Combine(outDir, "zero.csv"), a.ZeroShot.Select((z, i) => i + "," + z.ToString(CultureInfo.InvariantCulture) + "," + a.Motion[i].ToString(CultureInfo.InvariantCulture)));
+            Check(Scoring.Scores(a, sigBase.Id, dinoSmall.Id, null) == null, "nothing to score before Detect");
 
-            a.Save();
+            // Detect: both models over the proxy, two frames a second.
+            using (var enc = new ImageEncoder(sigBase)) Check(enc.OnGpu, "models run on the GPU");
+            sw.Restart();
+            Detector.Run(ffmpeg, a, proxy, new List<ModelInfo> { sigBase, dinoSmall }, (f, m) => { }, new CancelFlag());
+            took = sw.Elapsed.TotalSeconds;
+            Console.WriteLine(string.Format("detected with both models in {0:0.0}s ({1:0.0}x real time)", took, v.Duration / took));
+            var sf = a.FeaturesOf(sigBase.Id);
+            var df = a.FeaturesOf(dinoSmall.Id);
+            Check(sf != null && df != null && sf.Length == a.Count && df.Length == a.Count, "Detect stores both models' features");
+            Check(sf[0].Length == 768 && df[0].Length == 384, "feature sizes come from the models: " + sf[0].Length + ", " + df[0].Length);
+            Check(sf.All(e => Math.Abs(Models.Dot(e, e) - 1) < 1e-3) && df.All(e => Math.Abs(Models.Dot(e, e) - 1) < 1e-3), "embeddings are unit length");
+            var zs = Scoring.ZeroShot(a, sigBase.Id);
+            Check(zs.Max() - zs.Min() > 0.02, "zero-shot score varies: " + zs.Min().ToString("0.000") + ".." + zs.Max().ToString("0.000"));
+            File.WriteAllLines(Path.Combine(outDir, "zero.csv"), zs.Select((z, i) => i + "," + z.ToString(CultureInfo.InvariantCulture) + "," + a.Motion[i].ToString(CultureInfo.InvariantCulture)));
+
             var back = Analysis.Load(a.Key);
-            Check(back != null && back.Count == a.Count && back.Siglip[5].SequenceEqual(a.Siglip[5]) && back.Previews[7].SequenceEqual(a.Previews[7]), "cache round trip");
+            Check(back != null && back.Count == a.Count && back.FeaturesOf(sigBase.Id)[5].SequenceEqual(sf[5]) && back.FeaturesOf(dinoSmall.Id)[9].SequenceEqual(df[9]) && back.Previews[7].SequenceEqual(a.Previews[7]), "cache round trip with each model's features");
 
-            // Untrained DINOv2 learns from SigLIP's surest frames: it should agree with SigLIP, not just follow motion.
-            var zs = Scoring.ZeroShot(a);
-            var dl = Scoring.DinoFromSiglip(a);
+            // An untrained visual model learns from the prompt model's surest frames: it agrees with it, not with motion.
+            var dl = Scoring.VisualFromPrompts(a, dinoSmall.Id, zs);
             double cz = Corr(dl, zs), cm = Corr(dl, a.Motion);
             Console.WriteLine(string.Format("untrained DINOv2 vs SigLIP {0:0.00}, vs motion {1:0.00}", cz, cm));
             Check(cz > 0.5, "untrained DINOv2 follows what SigLIP sees");
 
-            // Untrained scores for each model choice.
-            foreach (Source src in Enum.GetValues(typeof(Source)))
+            // Untrained scores for each model choice; a visual model alone has nothing to learn from yet.
+            var choices = new[] { Tuple.Create("SigLIP 2", sigBase.Id, (string)null), Tuple.Create("DINOv2", (string)null, dinoSmall.Id), Tuple.Create("Both", sigBase.Id, dinoSmall.Id) };
+            foreach (var c in choices)
             {
-                var sc = Scoring.Scores(a, src, null);
+                var sc = Scoring.Scores(a, c.Item2, c.Item3, null);
+                if (sc == null) { Console.WriteLine("untrained " + c.Item1 + ": nothing yet"); continue; }
                 var kept = Scoring.Segments(Scoring.Mask(sc, 0.5, 1.5, null), a.Duration);
-                Console.WriteLine(string.Format("untrained {0}: keeps {1:0.0}s of {2:0.0}s in {3} parts", src, Segment.Total(kept), a.Duration, kept.Count));
+                Console.WriteLine(string.Format("untrained {0}: keeps {1:0.0}s of {2:0.0}s in {3} parts", c.Item1, Segment.Total(kept), a.Duration, kept.Count));
             }
+            Check(Scoring.Scores(a, null, dinoSmall.Id, null) == null, "an untrained visual model alone waits for learning");
 
-            // Learning: teach a made-up rule (second half is action) and check both models pick it up.
+            // Learning: teach a made-up rule (second half is action) and check every model choice picks it up.
             var labels = new bool[a.Count];
             for (int i = a.Count / 2; i < a.Count; i++) labels[i] = true;
             Learner.AddExample(a, labels);
             sw.Restart();
             var learner = Learner.Train();
             Console.WriteLine(string.Format("trained on {0} steps in {1:0.0}s", learner.Kept + learner.Cut, sw.Elapsed.TotalSeconds));
-            Check(learner.Trained && learner.Videos == 1, "learner trained from one export");
-            foreach (Source src in Enum.GetValues(typeof(Source)))
+            Check(learner.TrainedFor(sigBase.Id) && learner.TrainedFor(dinoSmall.Id) && learner.Videos == 1, "each model learned from one export");
+            foreach (var c in choices)
             {
-                var sc = Scoring.Scores(a, src, learner);
+                var sc = Scoring.Scores(a, c.Item2, c.Item3, learner);
                 int right = 0;
                 for (int i = 0; i < a.Count; i++) if ((sc[i] >= 0.5) == labels[i]) right++;
-                Check(right > a.Count * 0.85, string.Format("{0} learned the rule: {1:0}% right", src, 100.0 * right / a.Count));
+                Check(right > a.Count * 0.85, string.Format("{0} learned the rule: {1:0}% right", c.Item1, 100.0 * right / a.Count));
             }
             Learner.Forget();
             Check(!Learner.Train().Trained, "forget clears learning");
 
             // Export: joined parts under the cap, x264 and NVENC, with and without audio.
-            var scores = Scoring.Scores(a, Source.Both, null);
+            var scores = Scoring.Scores(a, sigBase.Id, dinoSmall.Id, null);
             var segs = Scoring.Segments(Scoring.Mask(scores, 0.5, 1.5, null), a.Duration);
             Export(ffmpeg, ffprobe, v, new Settings { TargetMB = 6, Segments = segs, AutoFps = false, Fps = 24 }, Path.Combine(outDir, "x264.mp4"));
             Export(ffmpeg, ffprobe, v, new Settings { TargetMB = 8, Segments = segs, AutoFps = false, Fps = 30, Nvenc = true }, Path.Combine(outDir, "nvenc.mp4"));
@@ -192,7 +230,8 @@ namespace IdleTrim
                 Check(size < v.SizeBytes * (info.Duration / v.Duration) * 1.1 && size < v.SizeBytes, "copy is never bigger than the source");
             }
 
-            PlayerTest(ffmpeg, v, segs);
+            PlayerTest(ffmpeg, v, null);
+            PlayerTest(ffmpeg, v, Proxy.PathFor(a.Key));
 
             Window(path, outDir, a);
         }
@@ -221,12 +260,10 @@ namespace IdleTrim
 
         // The C# tokenizer matches Hugging Face's (ids from the Python tokenizers package), and the C# text model
         // reproduces the built-in prompt embeddings made in Python.
-        static void TextTest()
+        static void TextTest(ModelInfo model)
         {
-            Check(TextEncoder.Present(), "text model found");
-            if (!TextEncoder.Present()) return;
             var sw = Stopwatch.StartNew();
-            using (var enc = new TextEncoder())
+            using (var enc = new TextEncoder(model))
             {
                 Console.WriteLine(string.Format("text model and tokenizer loaded in {0:0.0}s", sw.Elapsed.TotalSeconds));
                 var cases = new Dictionary<string, int[]>
@@ -239,29 +276,88 @@ namespace IdleTrim
                 foreach (var c in cases)
                 {
                     var ids = enc.Tokens(c.Key);
-                    bool same = ids.Take(c.Value.Length).SequenceEqual(c.Value) && ids.Skip(c.Value.Length).All(i => i == 0) && ids.Length == TextEncoder.Length;
+                    bool same = ids.Take(c.Value.Length).SequenceEqual(c.Value) && ids.Skip(c.Value.Length).All(i => i == 0) && ids.Length == enc.Length;
                     Check(same, "tokens match Hugging Face: " + c.Key.Substring(0, Math.Min(24, c.Key.Length)) + (same ? "" : " got " + string.Join(",", ids.Take(12))));
                 }
                 var builtIn = PromptSet.BuiltIn();
                 sw.Restart();
                 var embs = enc.Embed(builtIn.Action.Concat(builtIn.Idle).ToList());
-                var stored = builtIn.ActionEmb.Concat(builtIn.IdleEmb).ToList();
+                var be = PromptSet.For(model.Id);
+                var stored = be.Action.Concat(be.Idle).ToList();
                 double worst = Enumerable.Range(0, embs.Length).Min(i => Models.Dot(embs[i], stored[i]));
                 Console.WriteLine(string.Format("embedded {0} prompts in {1:0.00}s, worst match with Python {2:0.0000}", embs.Length, sw.Elapsed.TotalSeconds, worst));
                 Check(worst > 0.995, "C# text embeddings match the Python ones");
             }
         }
 
-        // Plays two parts with a cut between them and checks frames come in order, jump the cut and keep time with the audio.
-        static void PlayerTest(string ffmpeg, VideoInfo v, List<Segment> segs)
+        // Analyses and learning saved by the first version (one file with SigLIP 2 base and DINOv2 small inline) still load.
+        static void OldDataTest()
         {
+            string key = "oldformattest";
+            var rnd = new Random(1);
+            Func<int, float[]> vec = n => Models.Normalise(Enumerable.Range(0, n).Select(_ => (float)rnd.NextDouble() - 0.5f).ToArray());
+            string cache = Path.Combine(Analysis.DataDir, "cache");
+            Directory.CreateDirectory(cache);
+            byte[] jpeg;
+            using (var bmp = new Bitmap(320, 180)) using (var ms = new MemoryStream()) { bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Jpeg); jpeg = ms.ToArray(); }
+            var sig = Enumerable.Range(0, 3).Select(_ => vec(768)).ToArray();
+            var dn = Enumerable.Range(0, 3).Select(_ => vec(384)).ToArray();
+            using (var w = new BinaryWriter(File.Create(Path.Combine(cache, key + ".bin"))))
+            {
+                w.Write("IdleTrim1"); w.Write(1.5); w.Write(3);
+                for (int i = 0; i < 3; i++) { w.Write(1f); w.Write(0f); Analysis.WriteFloats(w, sig[i]); Analysis.WriteFloats(w, dn[i]); w.Write(jpeg.Length); w.Write(jpeg); }
+            }
+            var a = Analysis.Load(key);
+            Check(a != null && a.Count == 3 && a.FeaturesOf(Catalog.SiglipBase)[2].SequenceEqual(sig[2]) && a.FeaturesOf(Catalog.DinoSmall)[1].SequenceEqual(dn[1]), "an old analysis loads with its features");
+            var again = Analysis.Load(key);
+            Check(again != null && again.FeaturesOf(Catalog.DinoSmall)[0].SequenceEqual(dn[0]), "and stays loadable after it's rewritten in the new format");
+            foreach (var f in Directory.GetFiles(cache, key + "*")) File.Delete(f);
+
+            string learnDir = Path.Combine(Analysis.DataDir, "learn");
+            Directory.CreateDirectory(learnDir);
+            using (var w = new BinaryWriter(File.Create(Path.Combine(learnDir, key + ".bin"))))
+            {
+                w.Write("IdleTrimLearn1"); w.Write(100);
+                for (int i = 0; i < 100; i++) { w.Write(i >= 50); Analysis.WriteFloats(w, vec(768)); Analysis.WriteFloats(w, vec(384)); }
+            }
+            var l = Learner.Train();
+            Check(l.Videos == 1 && l.TrainedFor(Catalog.SiglipBase) && l.TrainedFor(Catalog.DinoSmall), "old learning still trains both models");
+            Learner.Forget();
+        }
+
+        // The catalog: built-in models, and adding one from Hugging Face by repo id (only its small config files are read).
+        static void CatalogTest()
+        {
+            Check(Catalog.All(ModelKind.Prompts).Count >= 4 && Catalog.All(ModelKind.Visual).Count >= 4, "built-in prompt and visual models");
+            Check(Catalog.Find(Catalog.SiglipBase).Present(), "the first models are found where the old version kept them");
+            try
+            {
+                var m = Catalog.AddFromHub("https://huggingface.co/onnx-community/siglip2-base-patch16-512-ONNX");
+                Console.WriteLine(string.Format("added {0}: {1}, {2} px, {3}, files {4}", m.Id, m.Kind, m.InputSize, m.SizeText, string.Join(", ", m.Files)));
+                Check(m.Kind == ModelKind.Prompts && m.InputSize == 512 && m.Files.Contains("tokenizer.json") && m.DownloadMB > 100 && Catalog.Find(m.Id) != null, "a SigLIP repo is added as a prompt model with its own input size");
+                var d = Catalog.AddFromHub("onnx-community/dinov2-base-ONNX");
+                Check(d.Kind == ModelKind.Visual && d.InputSize == 224 && d.Mean[0] > 0.4 && d.Mean[0] < 0.5, "a DINOv2 repo is added as a visual model with its own normalisation");
+                bool refused = false;
+                try { Catalog.AddFromHub("onnx-community/whisper-tiny"); } catch (Exception) { refused = true; }
+                Check(refused, "other kinds of models are refused with a reason");
+            }
+            catch (Exception ex) { Check(false, "adding from Hugging Face: " + ex.Message); }
+        }
+
+        // Plays two parts with a cut between them and checks frames come in order, jump the cut and keep time with the audio.
+        // source: a proxy to play from, or null for the original.
+        static void PlayerTest(string ffmpeg, VideoInfo v, string source)
+        {
+            string from = source ?? v.Path;
+            Console.WriteLine("playing from " + (source == null ? "the original" : "the proxy"));
             Player.Volume = 0;
             var parts = new List<Segment> { new Segment(10, 12), new Segment(40, 42) };
             var sw = Stopwatch.StartNew();
             var shown = new List<Player.Frame>();
             double firstAt = -1;
             byte[] firstFrame = null, afterCut = null;
-            using (var player = new Player(ffmpeg, v, parts, true))
+            double firstSource = 10, afterCutSource = 40;
+            using (var player = new Player(ffmpeg, v, parts, true, true, source))
             {
                 player.Start();
                 while (!player.Finished && sw.Elapsed.TotalSeconds < 15)
@@ -269,8 +365,8 @@ namespace IdleTrim
                     var f = player.Next();
                     if (f != null)
                     {
-                        if (firstAt < 0) { firstAt = sw.Elapsed.TotalSeconds; firstFrame = (byte[])f.Bgr.Clone(); }
-                        if (afterCut == null && f.Source >= 40) afterCut = (byte[])f.Bgr.Clone();
+                        if (firstAt < 0) { firstAt = sw.Elapsed.TotalSeconds; firstFrame = (byte[])f.Bgr.Clone(); firstSource = f.Source; }
+                        if (afterCut == null && f.Source >= 40) { afterCut = (byte[])f.Bgr.Clone(); afterCutSource = f.Source; }
                         shown.Add(new Player.Frame { At = f.At, Source = f.Source });
                         player.Recycle(f);
                     }
@@ -279,28 +375,39 @@ namespace IdleTrim
                 double total = sw.Elapsed.TotalSeconds - firstAt;
                 Console.WriteLine(string.Format("player: first frame after {0:0.00}s, {1} frames shown, 4 s played in {2:0.00}s", firstAt, shown.Count, total));
                 Check(player.Finished, "playback finishes");
-                Check(shown.Count > 4 * 30 * 0.8, "playback shows most frames: " + shown.Count);
+                // From the proxy every frame should make it; from the original a busy CPU may drop some, which is correct.
+                if (source != null) Check(shown.Count > 4 * 30 * 0.8, "playback shows most frames: " + shown.Count);
+                else Console.WriteLine("frames shown from the original: " + shown.Count);
                 Check(shown.Zip(shown.Skip(1), (x, y) => y.At > x.At).All(ok => ok), "frames in order");
                 Check(shown.All(f => (f.Source >= 10 && f.Source < 12.01) || (f.Source >= 40 && f.Source < 42.01)), "only kept parts play");
                 Check(shown.Any(f => f.Source >= 40), "playback jumps over the cut");
                 Check(total > 3.6 && total < 5.0, string.Format("plays in real time: {0:0.00}s for 4 s", total));
             }
             // Each part starts on its exact frame: same as a plain ffmpeg seek there, unlike the frame half a second before.
-            foreach (var probe in new[] { Tuple.Create(10.0, firstFrame), Tuple.Create(40.0, afterCut) })
+            // Each frame is compared at its own time: if a busy CPU made the player skip a late frame, the next one shows.
+            foreach (var probe in new[] { Tuple.Create(firstSource, firstFrame), Tuple.Create(afterCutSource, afterCut) })
             {
-                Func<double, byte[]> grab = t =>
+                Func<double, string, byte[]> grabFrom = (t, file) =>
                 {
                     var psi = new ProcessStartInfo(ffmpeg, string.Format(CultureInfo.InvariantCulture,
-                        "-hide_banner -loglevel error -nostdin -skip_loop_filter all -flags2 fast -ss {0:0.###} -i \"{1}\" -frames:v 1 -an -vf scale={2}:{3} -pix_fmt bgr24 -f rawvideo pipe:1", t, v.Path, Player.W, Player.H))
+                        "-hide_banner -loglevel error -nostdin -skip_loop_filter all -flags2 fast -ss {0:0.###} -i \"{1}\" -frames:v 1 -an -vf scale={2}:{3} -pix_fmt bgr24 -f rawvideo pipe:1", t, file, Player.W, Player.H))
                     { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true };
                     using (var p = Process.Start(psi)) using (var ms = new MemoryStream()) { p.StandardOutput.BaseStream.CopyTo(ms); p.WaitForExit(); return ms.ToArray(); }
                 };
+                Func<double, byte[]> grab = t => grabFrom(t, from);
                 Func<byte[], byte[], double> diff = (x, y) => { if (x == null || y == null || x.Length != y.Length) return 999; double d = 0; for (int i = 0; i < x.Length; i++) d += Math.Abs(x[i] - y[i]); return d / x.Length; };
                 // Same decoder settings, so the same frame should match closely; neighbours a frame either side shouldn't.
-                double fd = 1 / v.Fps;
+                double fd = 1 / (source == null ? v.Fps : Proxy.Fps(v));
                 double same = diff(probe.Item2, grab(probe.Item1)), before = diff(probe.Item2, grab(probe.Item1 - fd)), after = diff(probe.Item2, grab(probe.Item1 + fd)), early = diff(probe.Item2, grab(probe.Item1 - 0.5));
                 Console.WriteLine(string.Format("part at {0}s: first frame differs {1:0.0} from an exact seek, {2:0.0}/{3:0.0} from the frame before/after, {4:0.0} from 0.5 s earlier", probe.Item1, same, before, after, early));
                 Check(same < 2 && same <= before && same <= after, "playback starts each part on its exact frame (" + probe.Item1 + " s)");
+                if (source != null)
+                {
+                    // And the proxy shows the same moment as the original.
+                    double orig = diff(probe.Item2, grabFrom(probe.Item1, v.Path)), origEarly = diff(probe.Item2, grabFrom(probe.Item1 - 0.5, v.Path));
+                    Console.WriteLine(string.Format("  vs the original: {0:0.0} at the same time, {1:0.0} half a second earlier", orig, origEarly));
+                    Check(orig < origEarly / 2 && orig < 12, "the proxy frame is the original's frame at that time (" + probe.Item1 + " s)");
+                }
             }
         }
 
@@ -322,6 +429,7 @@ namespace IdleTrim
         static void Window(string path, string outDir, Analysis cached)
         {
             DarkForm.Quiet = true;
+            Timeline.UseCapture = false;   // never take the real mouse
             form = new MainForm(path) { StartPosition = FormStartPosition.Manual, Location = new Point(-20000, -20000), ShowInTaskbar = false };
             form.Shown += async (o, e) =>
             {
@@ -356,11 +464,52 @@ namespace IdleTrim
             Check(highKept > lowKept, string.Format("more sensitivity keeps more: {0:0.0}s vs {1:0.0}s", highKept, lowKept));
             sens.UserSet(50);
 
-            var model = Get<Segmented>("model");
-            foreach (int m in new[] { 0, 1, 2 })
+            // Models in the window: choosing them, and Detect.
             {
-                model.SelectedIndex = m;
-                Console.WriteLine(string.Format("model {0}: {1}", model.Items[m], Get<Label>("keptInfo").Text));
+                typeof(MainForm).GetField("ConfirmDownload", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(form, (Func<List<ModelInfo>, bool>)(m => false));
+                var pp = Get<Dropdown>("promptPick");
+                var vp = Get<Dropdown>("visualPick");
+                Func<Dropdown, string, int> indexOf = (d, id) => Enumerable.Range(0, d.Items.Count).First(i => d.Items[i].ToString().StartsWith(id));
+                Console.WriteLine("prompt models: " + string.Join(" | ", pp.Items.Cast<object>()));
+                Console.WriteLine("visual models: " + string.Join(" | ", vp.Items.Cast<object>()));
+                pp.SelectedIndex = indexOf(pp, "SigLIP 2 base");
+                vp.SelectedIndex = indexOf(vp, "DINOv2 small");
+                Console.WriteLine("both: " + Get<Label>("keptInfo").Text + " / " + Get<Label>("detectInfo").Text);
+                Check(Get<float[]>("scores") != null && Get<Label>("detectInfo").Text.StartsWith("Detected"), "a detected video scores with the chosen models");
+                pp.SelectedIndex = 0;   // None
+                Console.WriteLine("visual only: " + Get<Label>("keptInfo").Text + " / " + Get<Label>("detectInfo").Text);
+                pp.SelectedIndex = indexOf(pp, "SigLIP 2 base");
+                vp.SelectedIndex = 0;
+                Console.WriteLine("prompt only: " + Get<Label>("keptInfo").Text);
+                Check(Get<float[]>("scores") != null, "a prompt model alone scores");
+                vp.SelectedIndex = indexOf(vp, "DINOv2 small");
+                var big = Catalog.Find("onnx-community/siglip2-giant-opt-patch16-384-ONNX");
+                if (!big.Present())
+                {
+                    pp.SelectedIndex = indexOf(pp, "SigLIP 2 giant");
+                    vp.SelectedIndex = 0;   // a visual model that learned from earlier exports would still score
+                    Check(Get<float[]>("scores") == null && (Get<bool[]>("keep").All(k => k) || Get<sbyte[]>("overrides").Any(o => o != 0)), "a model not run yet keeps everything");
+                    vp.SelectedIndex = indexOf(vp, "DINOv2 small");
+                    string asked = null;
+                    typeof(MainForm).GetField("ConfirmDownload", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(form, (Func<List<ModelInfo>, bool>)(m => { asked = string.Join(", ", m.Select(x => x.Name + " " + x.SizeText)); return false; }));
+                    Call("Detect");
+                    Check(asked != null && asked.Contains("giant"), "Detect asks before downloading a model: " + asked);
+                    pp.SelectedIndex = indexOf(pp, "SigLIP 2 base");
+                }
+
+                // Detect from the window on a video with no features yet.
+                var an = Get<Analysis>("analysis");
+                var saved = new Dictionary<string, float[][]>(an.Features);
+                an.Features.Clear();
+                Call("Rescore");
+                Check(Get<float[]>("scores") == null && Get<Label>("detectInfo").Text.StartsWith("Not detected"), "before Detect: " + Get<Label>("detectInfo").Text);
+                var swd = Stopwatch.StartNew();
+                Call("Detect");
+                for (int i = 0; i < 1200 && (Get<bool>("busy") || Get<float[]>("scores") == null); i++) await Task.Delay(100);
+                Console.WriteLine(string.Format("window Detect: {0:0.0}s, {1} / {2}", swd.Elapsed.TotalSeconds, Get<Label>("status").Text, Get<Label>("keptInfo").Text));
+                Check(Get<float[]>("scores") != null && an.FeaturesOf(Catalog.SiglipBase) != null && an.FeaturesOf(Catalog.DinoSmall) != null, "Detect in the window runs the models and scores");
+                Check(an.FeaturesOf(Catalog.SiglipBase)[10].Zip(saved[Catalog.SiglipBase][10], (x, y) => x * y).Sum() > 0.98, "Detect gives the same features again");
+                typeof(MainForm).GetField("ConfirmDownload", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(form, (Func<List<ModelInfo>, bool>)(m => false));
             }
 
             // Remove a kept part, undo it.
@@ -391,18 +540,31 @@ namespace IdleTrim
             }
             else Check(false, "found two parts to merge");
 
-            // Drag the start of a kept part: left grows it, right shrinks it, both measured from where the drag began.
-            int edge = Enumerable.Range(5, a.Count - 10).FirstOrDefault(i => !original[i - 1] && original[i] && original.Skip(i).Take(5).All(x => x));
-            if (edge > 0)
+            // Drag the right edge of the first part out and back in, measured from where the drag began; then its left edge.
             {
-                Call("DragEdge", edge, edge - 4, false, true);
-                bool grew = Get<bool[]>("keep")[edge - 4];
-                Call("DragEdge", edge, edge + 3, false, false);
-                var k = Get<bool[]>("keep");
-                Check(grew && !k[edge - 4] && !k[edge + 2] && k[edge + 3], "dragging a part's edge moves it both ways");
-                Call("Undo");
+                int s0 = Array.IndexOf(original, true), e0 = s0;
+                while (e0 < original.Length && original[e0]) e0++;
+                int room = Array.IndexOf(original, true, e0) - e0;   // cut steps after the part
+                if (room > 2)
+                {
+                    int grow = Math.Min(4, room - 1);
+                    Call("DragEdge", s0, e0, true, e0 + grow, true);
+                    bool grew = Get<bool[]>("keep")[e0 + grow - 1] && !Get<bool[]>("keep")[e0 + grow];
+                    Call("DragEdge", s0, e0, true, e0 - 2, false);
+                    var k = Get<bool[]>("keep");
+                    Check(grew && k[e0 - 3] && !k[e0 - 2] && !k[e0], "dragging a part's right edge moves it out and back in");
+                    Call("Undo");
+                    if (s0 > 2)
+                    {
+                        Call("DragEdge", s0, e0, false, s0 - 2, true);
+                        k = Get<bool[]>("keep");
+                        Check(k[s0 - 2] && !k[s0 - 3] && k[e0 - 1], "dragging a part's left edge grows it to the left");
+                        Call("Undo");
+                    }
+                    Check(Get<bool[]>("keep").SequenceEqual(original), "undo takes edge drags back");
+                }
+                else Check(false, "found a part with room to grow");
             }
-            else Check(false, "found a part edge to drag");
 
             // Split a long kept part, remove only its second half, then drag over the split to join it again.
             int run = Enumerable.Range(0, a.Count - 8).FirstOrDefault(i => original.Skip(i).Take(8).All(x => x));
@@ -410,6 +572,22 @@ namespace IdleTrim
             Call("RemovePart", run + 5);
             var ks = Get<bool[]>("keep");
             Check(ks[run + 3] && !ks[run + 4], "a split part is removed on its own side");
+            Call("Undo");
+            // A split part's edges drag too: moving the left half's right edge moves the split.
+            {
+                int r0, r1;
+                Scoring.RunAt(Get<bool[]>("keep"), run + 2, Get<HashSet<int>>("splits"), out r0, out r1);
+                Check(r1 == run + 3, "the left half ends at the split");
+                Call("DragEdge", r0, run + 4, true, run + 6, true);
+                var sp = Get<HashSet<int>>("splits");
+                Check(sp.Contains(run + 6) && !sp.Contains(run + 4) && Enumerable.Range(run, 8).All(i => Get<bool[]>("keep")[i]), "dragging into the other half moves the split");
+                Call("RemovePart", run + 7);
+                ks = Get<bool[]>("keep");
+                Check(ks[run + 5] && !ks[run + 6], "the halves stay separate after the split moved");
+                Call("Undo");
+                Call("Undo");
+                Call("RemovePart", run + 5);
+            }
             Call("DragRange", run + 2, run + 7, true, true);
             ks = Get<bool[]>("keep");
             Check(Get<HashSet<int>>("splits").Count == 0 && Enumerable.Range(run, 7).All(i => ks[i]), "dragging over a split joins the parts");
@@ -449,10 +627,142 @@ namespace IdleTrim
                 }
                 else Check(false, "found a cut gap for the mouse test");
                 Call("ResetEdits");
+
+                // Grab a kept part near its right end and drag: the right edge follows by exactly the drag, with no jump at the start.
+                var seg = Get<List<Segment>>("segments")[0];
+                double stepPx = Analysis.Step / timeline.ViewLength * (timeline.Width - 1);
+                int grabX = xOf(seg.End - 1.2);
+
+                down.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 1, grabX, bandY, 0) });
+                move.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 0, grabX + 5, bandY, 0) });
+                double endAfterNudge = Get<List<Segment>>("segments")[0].End;
+                int dx = (int)Math.Round(stepPx * 3);
+                move.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 0, grabX + dx, bandY, 0) });
+                up.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 1, grabX + dx, bandY, 0) });
+                double endAfter = Get<List<Segment>>("segments")[0].End;
+                Console.WriteLine(string.Format("mouse edge drag: end {0:0.0}s -> {1:0.0}s after a 5 px nudge -> {2:0.0}s after {3} px", seg.End, endAfterNudge, endAfter, dx));
+                Check(Math.Abs(endAfterNudge - seg.End) <= Analysis.Step + 1e-6, "mouse: grabbing a part doesn't make its edge jump");
+                Check(Math.Abs(endAfter - (seg.End + 3 * Analysis.Step)) < 1e-6 && Math.Abs(Get<List<Segment>>("segments")[0].Start - seg.Start) < 1e-6, "mouse: dragging near the right end moves only the right edge, by the drag");
+                Call("Undo");
+
+                // Near the left end: the left edge moves.
+                int grabL = xOf(seg.Start + 1.2);
+                drag(MouseButtons.Left, grabL, grabL + dx);
+                var after = Get<List<Segment>>("segments")[0];
+                Check(Math.Abs(after.Start - (seg.Start + 3 * Analysis.Step)) < 1e-6 && Math.Abs(after.End - seg.End) < 1e-6, "mouse: dragging near the left end moves only the left edge");
+                Call("Undo");
+
+                // Double-click inside a part splits it there; double-click on the split removes it; in a cut area it does nothing.
+                var dbl = typeof(Control).GetMethod("OnMouseDoubleClick", BindingFlags.NonPublic | BindingFlags.Instance);
+                int splitStep = (int)Math.Round((seg.Start + 3) / Analysis.Step);
+                dbl.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 2, xOf(seg.Start + 3), bandY, 0) });
+                Check(Get<HashSet<int>>("splits").Contains(splitStep) && Get<bool[]>("keep").SequenceEqual(original), "mouse: double-click splits a part where you click");
+                dbl.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 2, xOf(seg.Start + 3), bandY, 0) });
+                Check(Get<HashSet<int>>("splits").Count == 0, "mouse: double-click on the split removes it");
+                var segsNow2 = Get<List<Segment>>("segments");
+                if (segsNow2.Count >= 2)
+                {
+                    dbl.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 2, xOf((segsNow2[0].End + segsNow2[1].Start) / 2), bandY, 0) });
+                    Check(Get<HashSet<int>>("splits").Count == 0, "mouse: double-click in a cut area does nothing");
+                }
+
+                // A plain click on a kept part only moves the playhead.
+                drag(MouseButtons.Left, xOf(seg.Start + 2), xOf(seg.Start + 2));
+                Check(Get<bool[]>("keep").SequenceEqual(original) && Math.Abs(timeline.Playhead - (seg.Start + 2)) < 0.2, "mouse: clicking a part just moves the playhead");
+                Call("ResetEdits");
+            }
+
+            // Scrub to the very start, also past the left edge, then let go: the playhead stays at the start (and plays on from
+            // there when playing) instead of going back to where it was.
+            {
+                var down = typeof(Control).GetMethod("OnMouseDown", BindingFlags.NonPublic | BindingFlags.Instance);
+                var move = typeof(Control).GetMethod("OnMouseMove", BindingFlags.NonPublic | BindingFlags.Instance);
+                var up = typeof(Control).GetMethod("OnMouseUp", BindingFlags.NonPublic | BindingFlags.Instance);
+                foreach (bool whilePlaying in new[] { false, true })
+                    foreach (int endX in new[] { 0, -60 })
+                    {
+                        timeline.Playhead = a.Duration / 2;
+                        Call("ShowPlayhead");
+                        if (whilePlaying) { Call("PlayPause"); await Task.Delay(1500); }
+                        int x = timeline.Width / 2;
+                        down.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 1, x, 10, 0) });
+                        for (; x > endX; x -= 12) { move.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 0, x, 10, 0) }); await Task.Delay(10); }
+                        move.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 0, endX, 10, 0) });
+                        up.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 1, endX, 10, 0) });
+                        double atRelease = timeline.Playhead, highest = 0;
+                        var watch = Stopwatch.StartNew();
+                        while (watch.Elapsed.TotalSeconds < 2.5) { highest = Math.Max(highest, timeline.Playhead); await Task.Delay(10); }
+                        var firstKept = Get<List<Segment>>("segments")[0];
+                        double limit = whilePlaying ? Math.Max(firstKept.Start, 0) + 2.6 : 0.01;
+                        Console.WriteLine(string.Format("scrub to the start{0} (x={1}): {2:0.00}s at release, highest after {3:0.00}s, first part starts {4:0.0}s",
+                            whilePlaying ? " while playing" : "", endX, atRelease, highest, firstKept.Start));
+                        Check(atRelease < 0.01 && highest <= limit, string.Format("scrubbing to the very start stays there{0} (x={1})", whilePlaying ? " while playing" : "", endX));
+                        if (whilePlaying) Call("StopPlayback");
+                    }
+            }
+
+            // A release that never arrived (the pointer let go outside): the next move without a button ends the drag, so the
+            // playhead doesn't follow a pointer that isn't pressed.
+            {
+                var down = typeof(Control).GetMethod("OnMouseDown", BindingFlags.NonPublic | BindingFlags.Instance);
+                var move = typeof(Control).GetMethod("OnMouseMove", BindingFlags.NonPublic | BindingFlags.Instance);
+                int x = timeline.Width / 2;
+                down.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 1, x, 10, 0) });
+                move.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 0, x - 40, 10, 0) });
+                double held = timeline.Playhead;
+                move.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.None, 0, x + 200, 10, 0) });
+                Check(!timeline.Scrubbing && Math.Abs(timeline.Playhead - held) < 1e-9, "a missed release ends the drag instead of dragging the playhead along");
+            }
+
+            // Drawing the timeline and the preview must be cheap, since a scrub repaints both on every mouse move.
+            {
+                var paintSw = Stopwatch.StartNew();
+                using (var bmp = new Bitmap(timeline.Width, timeline.Height))
+                    for (int i = 0; i < 30; i++) { timeline.Playhead = 10 + i; timeline.DrawToBitmap(bmp, new Rectangle(0, 0, bmp.Width, bmp.Height)); }
+                double tlMs = paintSw.Elapsed.TotalMilliseconds / 30;
+                var pv = Get<Preview>("preview");
+                paintSw.Restart();
+                using (var bmp = new Bitmap(pv.Width, pv.Height))
+                    for (int i = 0; i < 30; i++) { timeline.Playhead = 10 + i; Call("ShowPlayhead"); pv.DrawToBitmap(bmp, new Rectangle(0, 0, bmp.Width, bmp.Height)); }
+                double pvMs = paintSw.Elapsed.TotalMilliseconds / 30;
+                Console.WriteLine(string.Format("drawing: timeline {0:0.0}ms, preview {1:0.0}ms ({2}x{3} and {4}x{5} px)", tlMs, pvMs, timeline.Width, timeline.Height, pv.Width, pv.Height));
+                Check(tlMs + pvMs < 16, "a scrub step draws within one screen refresh");
+            }
+
+            // Scrubbing stays responsive: drag along the strip with little pauses, as a hand does, and time the longest stall of
+            // the window, which includes the timers that warm up playback and the repaints. The playhead must follow every move.
+            {
+                var down = typeof(Control).GetMethod("OnMouseDown", BindingFlags.NonPublic | BindingFlags.Instance);
+                var move = typeof(Control).GetMethod("OnMouseMove", BindingFlags.NonPublic | BindingFlags.Instance);
+                var up = typeof(Control).GetMethod("OnMouseUp", BindingFlags.NonPublic | BindingFlags.Instance);
+                foreach (bool whilePlaying in new[] { false, true })
+                {
+                    if (whilePlaying) { Call("PlayPause"); await Task.Delay(1500); }
+                    int x = timeline.Width / 5;
+                    down.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 1, x, 10, 0) });
+                    double worst = 0, behind = 0;
+                    var gap = Stopwatch.StartNew();
+                    for (int i = 0; i < 120; i++)
+                    {
+                        x += 3;
+                        move.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 0, x, 10, 0) });
+                        double want = timeline.ViewStart + (double)x / (timeline.Width - 1) * timeline.ViewLength;
+                        behind = Math.Max(behind, Math.Abs(timeline.Playhead - want));
+                        await Task.Delay(i % 20 == 19 ? 250 : 16);   // a pause now and then lets the warm-up timers fire
+                        double took = gap.Elapsed.TotalMilliseconds - (i % 20 == 19 ? 250 : 16);
+                        worst = Math.Max(worst, took);
+                        gap.Restart();
+                    }
+                    up.Invoke(timeline, new object[] { new MouseEventArgs(MouseButtons.Left, 1, x, 10, 0) });
+                    Console.WriteLine(string.Format("scrubbing{0}: longest stall {1:0}ms, playhead off by at most {2:0.000}s", whilePlaying ? " while playing" : "", worst, behind));
+                    Check(behind < 0.01, "the playhead follows every scrub move" + (whilePlaying ? " while playing" : ""));
+                    Check(worst < 60, string.Format("scrubbing{0} doesn't stall the window ({1:0}ms)", whilePlaying ? " while playing" : "", worst));
+                    if (whilePlaying) Call("StopPlayback");
+                }
             }
 
             // Your own prompts: a new one is read by the text model, the scores change, built-in ones come back.
-            var before0 = (float[])Scoring.ZeroShot(a).Clone();
+            var before0 = (float[])Scoring.ZeroShot(a, Catalog.SiglipBase).Clone();
             var builtInSet = PromptSet.BuiltIn();
             var myAction = builtInSet.Action.Take(2).Concat(new[] { "a final kill cam with a slow motion replay" }).ToList();
             var myIdle = new List<string> { "a game menu or loadout screen", "an empty hallway with nobody around" };
@@ -462,7 +772,7 @@ namespace IdleTrim
             while (promptError == "pending" && sw2.Elapsed.TotalSeconds < 60) await Task.Delay(100);
             Console.WriteLine(string.Format("new prompts read in {0:0.0}s: {1}", sw2.Elapsed.TotalSeconds, Get<Label>("status").Text));
             Check(promptError == null && PromptSet.Current.Custom && PromptSet.Current.Action.SequenceEqual(myAction) && PromptSet.Current.Idle.SequenceEqual(myIdle), "your prompts are read and saved");
-            Check(!Scoring.ZeroShot(a).SequenceEqual(before0), "your prompts change the scores without re-analysis");
+            Check(!Scoring.ZeroShot(a, Catalog.SiglipBase).SequenceEqual(before0), "your prompts change the scores without re-analysis");
             if (Get<Learner>("learner") == null || !Get<Learner>("learner").Trained)
                 Check(Get<Label>("learnInfo").Text.Contains("your prompts"), "learning text mentions your prompts");
             using (var dlg = new PromptsDialog(PromptSet.Current, false) { StartPosition = FormStartPosition.Manual, Location = new Point(-20000, -20000) })
@@ -474,7 +784,7 @@ namespace IdleTrim
             }
             promptError = "pending";
             Call("ApplyPrompts", builtInSet.Action, builtInSet.Idle, (Action<string>)(e => promptError = e));
-            Check(promptError == null && !PromptSet.Current.Custom && Scoring.ZeroShot(a).SequenceEqual(before0), "built-in prompts come back exactly");
+            Check(promptError == null && !PromptSet.Current.Custom && Scoring.ZeroShot(a, Catalog.SiglipBase).SequenceEqual(before0), "built-in prompts come back exactly");
 
             // Play from the window for a moment, silently.
             Player.Volume = 0;
@@ -497,6 +807,8 @@ namespace IdleTrim
             Check(Get<Player>("player") != null && Get<Preview>("preview").Playing, "play shows video in the preview");
             Check(tl.Playhead > startHead + 1, string.Format("playhead moves while playing: {0:0.0} -> {1:0.0}", startHead, tl.Playhead));
             Shot(outDir, "1b-playing");
+            for (int i = 0; i < 1200 && !Get<bool>("proxyReady"); i++) await Task.Delay(100);
+            Check(Get<bool>("proxyReady") && Get<Player>("player") != null, "playback uses the proxy: " + Get<Label>("status").Text);
             // Click elsewhere on the strip while playing: the marker goes there at once, stays, and playback carries on from it.
             {
                 var mdown = typeof(Control).GetMethod("OnMouseDown", BindingFlags.NonPublic | BindingFlags.Instance);

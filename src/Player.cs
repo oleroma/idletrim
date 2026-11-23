@@ -44,11 +44,12 @@ namespace IdleTrim
         public double FirstFrameMs = -1, AudioReadyMs = -1;   // how long the decoders took to deliver, for tuning
 
         // armed false: decode ahead but don't start until Arm, so Play can start instantly.
-        public Player(string ffmpeg, VideoInfo v, List<Segment> parts, bool withAudio, bool armed = true)
+        // source: the file to decode, normally the video's proxy (same timeline, small and quick to seek); null for the original.
+        public Player(string ffmpeg, VideoInfo v, List<Segment> parts, bool withAudio, bool armed = true, string source = null)
         {
             this.armed = armed;
             this.ffmpeg = ffmpeg;
-            path = v.Path;
+            path = source ?? v.Path;
             this.parts = parts;
             fps = Math.Min(30, v.Fps);
             audio = withAudio && v.HasAudio;

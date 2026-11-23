@@ -6,29 +6,32 @@ using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Net.Http;
-using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
 
 namespace IdleTrim
 {
-    // Everything IdleTrim knows about one video, one entry per half second.
+    // Everything IdleTrim knows about one video, one entry per half second. Opening a video only builds the index
+    // (thumbnails and motion, plus the playback proxy) with no AI; Detect adds each model's features, stored per model.
     public class Analysis
     {
         public const double Step = 0.5;
-        public const int SigDim = 768, DinoDim = 384;
 
         public string Key;
         public double Duration;
         public int Count;
         public float[] Motion;      // mean absolute change between frames, 0..255
-        public float[] ZeroShot;    // best action prompt minus best idle prompt (SigLIP cosine)
-        public float[][] Siglip;    // SigLIP 2 image embeddings, L2-normalised
-        public float[][] Dino;      // DINOv2 CLS embeddings, L2-normalised
         public byte[][] Previews;   // 320x180 JPEG per step
+        // Model id -> one L2-normalised embedding per step. Filled by Detect, or by older analyses for the original two models.
+        public readonly Dictionary<string, float[][]> Features = new Dictionary<string, float[][]>();
+
+        public float[][] FeaturesOf(string modelId)
+        {
+            float[][] f;
+            return modelId != null && Features.TryGetValue(modelId, out f) ? f : null;
+        }
 
         public double TimeOf(int step) { return Math.Min(Duration, step * Step); }
         public int StepAt(double seconds) { return Math.Max(0, Math.Min(Count - 1, (int)(seconds / Step))); }
@@ -47,64 +50,118 @@ namespace IdleTrim
             get { return Environment.GetEnvironmentVariable("IDLETRIM_DATA") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "IdleTrim"); }
         }
 
-        static string CachePath(string key) { return Path.Combine(DataDir, "cache", key + ".bin"); }
+        static string CacheDir { get { return Path.Combine(DataDir, "cache"); } }
+        static string IndexPath(string key) { return Path.Combine(CacheDir, key + ".bin"); }
+        static string FeaturePath(string key, string modelId) { return Path.Combine(CacheDir, key + "." + ModelInfo.Slug(modelId) + ".feat"); }
 
         public void Save()
         {
-            string path = CachePath(Key);
-            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            string path = IndexPath(Key);
+            Directory.CreateDirectory(CacheDir);
             using (var w = new BinaryWriter(File.Create(path + ".tmp")))
             {
-                w.Write("IdleTrim1");
+                w.Write("IdleTrim2");
                 w.Write(Duration);
                 w.Write(Count);
                 for (int i = 0; i < Count; i++)
                 {
                     w.Write(Motion[i]);
-                    w.Write(ZeroShot[i]);
-                    WriteFloats(w, Siglip[i]);
-                    WriteFloats(w, Dino[i]);
                     w.Write(Previews[i].Length);
                     w.Write(Previews[i]);
                 }
+            }
+            File.Move(path + ".tmp", path, true);
+            foreach (var f in Features) SaveFeatures(f.Key, f.Value);
+        }
+
+        public void SaveFeatures(string modelId, float[][] features)
+        {
+            Features[modelId] = features;
+            string path = FeaturePath(Key, modelId);
+            Directory.CreateDirectory(CacheDir);
+            using (var w = new BinaryWriter(File.Create(path + ".tmp")))
+            {
+                w.Write("IdleTrimFeat1");
+                w.Write(modelId);
+                w.Write(features.Length);
+                w.Write(features.Length > 0 ? features[0].Length : 0);
+                foreach (var e in features) WriteFloats(w, e);
             }
             File.Move(path + ".tmp", path, true);
         }
 
         public static Analysis Load(string key)
         {
-            string path = CachePath(key);
+            string path = IndexPath(key);
             if (!File.Exists(path)) return null;
             try
             {
+                Analysis a;
                 using (var r = new BinaryReader(File.OpenRead(path)))
                 {
-                    if (r.ReadString() != "IdleTrim1") return null;
-                    var a = new Analysis { Key = key, Duration = r.ReadDouble(), Count = r.ReadInt32() };
-                    a.Allocate();
-                    for (int i = 0; i < a.Count; i++)
+                    string format = r.ReadString();
+                    if (format == "IdleTrim1") a = LoadOld(r, key);
+                    else if (format == "IdleTrim2")
                     {
-                        a.Motion[i] = r.ReadSingle();
-                        a.ZeroShot[i] = r.ReadSingle();
-                        a.Siglip[i] = ReadFloats(r, SigDim);
-                        a.Dino[i] = ReadFloats(r, DinoDim);
-                        a.Previews[i] = r.ReadBytes(r.ReadInt32());
+                        a = new Analysis { Key = key, Duration = r.ReadDouble(), Count = r.ReadInt32() };
+                        a.Allocate();
+                        for (int i = 0; i < a.Count; i++)
+                        {
+                            a.Motion[i] = r.ReadSingle();
+                            a.Previews[i] = r.ReadBytes(r.ReadInt32());
+                        }
                     }
-                    return a;
+                    else return null;
                 }
+                if (a.Features.Count > 0) a.Save();   // an old analysis: rewrite as index plus per-model features
+                foreach (string file in Directory.GetFiles(CacheDir, key + ".*.feat"))
+                {
+                    try
+                    {
+                        using (var r = new BinaryReader(File.OpenRead(file)))
+                        {
+                            if (r.ReadString() != "IdleTrimFeat1") continue;
+                            string id = r.ReadString();
+                            int n = r.ReadInt32(), dim = r.ReadInt32();
+                            if (n != a.Count) continue;
+                            var f = new float[n][];
+                            for (int i = 0; i < n; i++) f[i] = ReadFloats(r, dim);
+                            a.Features[id] = f;
+                        }
+                    }
+                    catch (Exception) { }   // a damaged feature file: that model detects again
+                }
+                return a;
             }
             catch (Exception)
             {
-                return null;   // damaged cache: analyse again
+                return null;   // damaged cache: index again
             }
+        }
+
+        // The first format had SigLIP 2 base and DINOv2 small features inline; they become those models' feature files.
+        static Analysis LoadOld(BinaryReader r, string key)
+        {
+            var a = new Analysis { Key = key, Duration = r.ReadDouble(), Count = r.ReadInt32() };
+            a.Allocate();
+            var sig = new float[a.Count][];
+            var dn = new float[a.Count][];
+            for (int i = 0; i < a.Count; i++)
+            {
+                a.Motion[i] = r.ReadSingle();
+                r.ReadSingle();   // the old built-in zero-shot score, now computed from the features
+                sig[i] = ReadFloats(r, 768);
+                dn[i] = ReadFloats(r, 384);
+                a.Previews[i] = r.ReadBytes(r.ReadInt32());
+            }
+            a.Features[Catalog.SiglipBase] = sig;
+            a.Features[Catalog.DinoSmall] = dn;
+            return a;
         }
 
         internal void Allocate()
         {
             Motion = new float[Count];
-            ZeroShot = new float[Count];
-            Siglip = new float[Count][];
-            Dino = new float[Count][];
             Previews = new byte[Count][];
         }
 
@@ -121,31 +178,15 @@ namespace IdleTrim
         }
     }
 
-    // SigLIP 2 (base, patch16, 224) and DINOv2 (small), both Apache 2.0, run with ONNX Runtime on the GPU when it can.
-    public class Models : IDisposable
+    // Shared helpers for the models: where they live, downloading, ONNX Runtime options, vector maths.
+    public static class Models
     {
-        public const string SiglipUrl = "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main/onnx/vision_model_fp16.onnx";
-        public const string DinoUrl = "https://huggingface.co/onnx-community/dinov2-small-ONNX/resolve/main/onnx/model.onnx";
-        public const int Size = 224;
-
-        readonly InferenceSession siglip, dino;
-        public readonly bool OnGpu;
-
         public static string Dir { get { return Environment.GetEnvironmentVariable("IDLETRIM_MODELS") ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models"); } }
-        static string SiglipPath { get { return Path.Combine(Dir, "siglip2", "vision_model_fp16.onnx"); } }
-        static string DinoPath { get { return Path.Combine(Dir, "dinov2-small", "model.onnx"); } }
-
-        public static bool Present() { return File.Exists(SiglipPath) && File.Exists(DinoPath); }
-
-        public static void Download(Action<int, string> progress, CancelFlag cancel)
-        {
-            Fetch(new[] { new[] { SiglipUrl, SiglipPath, "SigLIP 2" }, new[] { DinoUrl, DinoPath, "DINOv2" } }, progress, cancel);
-        }
 
         // files: { url, destination, name } each; files already there are skipped.
         public static void Fetch(string[][] files, Action<int, string> progress, CancelFlag cancel)
         {
-            using (var http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) })
+            using (var http = new HttpClient { Timeout = TimeSpan.FromHours(2) })
             {
                 for (int f = 0; f < files.Length; f++)
                 {
@@ -179,23 +220,6 @@ namespace IdleTrim
             }
         }
 
-        public Models()
-        {
-            OnGpu = true;
-            try
-            {
-                siglip = new InferenceSession(SiglipPath, Options(true));
-                dino = new InferenceSession(DinoPath, Options(true));
-            }
-            catch (Exception)
-            {
-                OnGpu = false;
-                if (siglip != null) siglip.Dispose();
-                siglip = new InferenceSession(SiglipPath, Options(false));
-                dino = new InferenceSession(DinoPath, Options(false));
-            }
-        }
-
         internal static SessionOptions Options(bool gpu)
         {
             var o = new SessionOptions();
@@ -208,81 +232,14 @@ namespace IdleTrim
             return o;
         }
 
-        // frames: 320x180 RGB24 buffers. Fills the embeddings and the zero-shot score for each.
-        public void Embed(List<byte[]> frames, int width, int height, float[][] sig, float[][] dn, float[] zero)
+        // Opens a model on the GPU through DirectML, or on the CPU if that fails.
+        internal static InferenceSession Open(string path, out bool onGpu)
         {
-            int n = frames.Count;
-            var sigIn = new DenseTensor<float>(new[] { n, 3, Size, Size });
-            var dinoIn = new DenseTensor<float>(new[] { n, 3, Size, Size });
-            var resized = new float[Size * Size * 3];
-            float[] dMean = { 0.485f, 0.456f, 0.406f }, dStd = { 0.229f, 0.224f, 0.225f };
-            for (int b = 0; b < n; b++)
+            try { onGpu = true; return new InferenceSession(path, Options(true)); }
+            catch (Exception)
             {
-                Resize(frames[b], width, height, resized);
-                for (int c = 0; c < 3; c++)
-                    for (int y = 0; y < Size; y++)
-                        for (int x = 0; x < Size; x++)
-                        {
-                            float v = resized[(y * Size + x) * 3 + c];
-                            sigIn[b, c, y, x] = (v - 0.5f) / 0.5f;
-                            dinoIn[b, c, y, x] = (v - dMean[c]) / dStd[c];
-                        }
-            }
-
-            using (var outs = siglip.Run(new[] { NamedOnnxValue.CreateFromTensor(First(siglip), sigIn) }))
-            {
-                Tensor<float> pooled = null;
-                foreach (var o in outs) if (o.Name == "pooler_output") pooled = o.AsTensor<float>();
-                for (int b = 0; b < n; b++)
-                {
-                    var e = new float[Analysis.SigDim];
-                    for (int i = 0; i < e.Length; i++) e[i] = pooled[b, i];
-                    sig[b] = Normalise(e);
-                    zero[b] = PromptSet.Current.Score(sig[b]);
-                }
-            }
-
-            using (var outs = dino.Run(new[] { NamedOnnxValue.CreateFromTensor(First(dino), dinoIn) }))
-            {
-                Tensor<float> hidden = null;
-                foreach (var o in outs) { hidden = o.AsTensor<float>(); break; }
-                for (int b = 0; b < n; b++)
-                {
-                    var e = new float[Analysis.DinoDim];
-                    for (int i = 0; i < e.Length; i++) e[i] = hidden[b, 0, i];   // CLS token
-                    dn[b] = Normalise(e);
-                }
-            }
-        }
-
-        static string First(InferenceSession s)
-        {
-            foreach (var k in s.InputMetadata.Keys) return k;
-            return "pixel_values";
-        }
-
-        // Bilinear resize of an RGB24 frame to Size x Size, values 0..1, interleaved.
-        static void Resize(byte[] src, int w, int h, float[] dst)
-        {
-            float sx = (float)w / Size, sy = (float)h / Size;
-            for (int y = 0; y < Size; y++)
-            {
-                float fy = Math.Max(0, (y + 0.5f) * sy - 0.5f);
-                int y0 = Math.Min(h - 1, (int)fy), y1 = Math.Min(h - 1, y0 + 1);
-                float ty = fy - y0;
-                for (int x = 0; x < Size; x++)
-                {
-                    float fx = Math.Max(0, (x + 0.5f) * sx - 0.5f);
-                    int x0 = Math.Min(w - 1, (int)fx), x1 = Math.Min(w - 1, x0 + 1);
-                    float tx = fx - x0;
-                    for (int c = 0; c < 3; c++)
-                    {
-                        float a = src[(y0 * w + x0) * 3 + c], b = src[(y0 * w + x1) * 3 + c];
-                        float d = src[(y1 * w + x0) * 3 + c], e = src[(y1 * w + x1) * 3 + c];
-                        float top = a + (b - a) * tx, bottom = d + (e - d) * tx;
-                        dst[(y * Size + x) * 3 + c] = (top + (bottom - top) * ty) / 255f;
-                    }
-                }
+                onGpu = false;
+                return new InferenceSession(path, new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_BASIC });
             }
         }
 
@@ -299,34 +256,31 @@ namespace IdleTrim
             if (n > 0) for (int i = 0; i < v.Length; i++) v[i] /= n;
             return v;
         }
-
-        public void Dispose()
-        {
-            siglip.Dispose();
-            dino.Dispose();
-        }
     }
 
-    public static class Analyzer
+    // Builds a video's index with no AI: decodes at 10 fps, measures motion, keeps a thumbnail every half second.
+    public static class Indexer
     {
         public const int Width = 320, Height = 180, DecodeFps = 10;
         const int PerStep = (int)(DecodeFps * Analysis.Step);
-        const int Batch = 16;
 
-        // Decodes at 10 fps, measures motion on every frame, sends 2 frames a second to the models.
-        public static Analysis Run(string ffmpeg, VideoInfo v, Models models, Action<double> progress, CancelFlag cancel)
+        // With makeProxy, the same decode also writes the playback proxy (see Proxy).
+        public static Analysis Run(string ffmpeg, VideoInfo v, Action<double> progress, CancelFlag cancel, bool makeProxy = true)
         {
             var a = new Analysis { Key = Analysis.KeyFor(v.Path), Duration = v.Duration };
             int expected = (int)Math.Ceiling(v.Duration / Analysis.Step) + 2;
             var motion = new List<float>(expected);
-            var zero = new List<float>(expected);
-            var sig = new List<float[]>(expected);
-            var dn = new List<float[]>(expected);
             var previews = new List<byte[]>(expected);
-            var batch = new List<byte[]>(Batch);
 
-            string args = string.Format("-hide_banner -loglevel error -nostdin -hwaccel d3d11va -i \"{0}\" -an -sn -dn -vf fps={1},scale={2}:{3} -pix_fmt rgb24 -f rawvideo pipe:1",
-                                        v.Path, DecodeFps, Width, Height);
+            string proxy = Proxy.PathFor(a.Key), proxyPart = proxy + ".part";
+            if (makeProxy) Directory.CreateDirectory(Path.GetDirectoryName(proxy));
+            // One decode feeds both: shrunk to 640x360 (on the GPU when it can), then split into the analysis frames and the proxy.
+            var dec = makeProxy ? Proxy.PickDecoder(ffmpeg, v.Path) : null;
+            string args = makeProxy
+                ? string.Format(CultureInfo.InvariantCulture, "-hide_banner -loglevel error -nostdin -y {5} -i \"{0}\" -filter_complex \"[0:v:0]{6},split=2[an][pv];[an]fps={1},scale={2}:{3},format=rgb24[a];[pv]fps={4:0.###},format=yuv420p[px]\" -map \"[a]\" -f rawvideo pipe:1",
+                                v.Path, DecodeFps, Width, Height, Proxy.Fps(v), dec[0], dec[1]) + Proxy.OutputArgs(v, "[px]", proxyPart)
+                : string.Format("-hide_banner -loglevel error -nostdin -hwaccel d3d11va -i \"{0}\" -an -sn -dn -vf fps={1},scale={2}:{3} -pix_fmt rgb24 -f rawvideo pipe:1",
+                                v.Path, DecodeFps, Width, Height);
             var psi = new ProcessStartInfo(ffmpeg, args)
             {
                 UseShellExecute = false,
@@ -356,23 +310,24 @@ namespace IdleTrim
                         {
                             if (index > 0) motion.Add(motionSum / PerStep);
                             motionSum = 0;
-                            var copy = (byte[])frame.Clone();
-                            batch.Add(copy);
-                            previews.Add(Jpeg(copy));
-                            if (batch.Count == Batch) Flush(models, batch, sig, dn, zero);
+                            previews.Add(Jpeg(frame));
                             progress(Math.Min(0.99, index / (v.Duration * DecodeFps)));
                         }
                         prev = prev ?? new byte[frameBytes];
                         Buffer.BlockCopy(frame, 0, prev, 0, frameBytes);
                         index++;
                     }
-                    if (batch.Count > 0) Flush(models, batch, sig, dn, zero);
                     proc.WaitForExit();
                 }
                 finally
                 {
                     cancel.Current = null;
                     try { if (!proc.HasExited) proc.Kill(); } catch { }
+                    if (makeProxy)
+                    {
+                        if (!cancel.Cancelled && proc.HasExited && proc.ExitCode == 0) try { Proxy.Finish(proxyPart, proxy); } catch { }
+                        try { File.Delete(proxyPart); } catch { }
+                    }
                 }
                 if (cancel.Cancelled) throw new CancelledException();
                 if (previews.Count == 0)
@@ -385,29 +340,13 @@ namespace IdleTrim
             for (int i = 0; i < a.Count; i++)
             {
                 a.Motion[i] = i < motion.Count ? motion[i] : 0;
-                a.ZeroShot[i] = zero[i];
-                a.Siglip[i] = sig[i];
-                a.Dino[i] = dn[i];
                 a.Previews[i] = previews[i];
             }
             progress(1);
             return a;
         }
 
-        static void Flush(Models models, List<byte[]> batch, List<float[]> sig, List<float[]> dn, List<float> zero)
-        {
-            int n = batch.Count;
-            var s = new float[n][];
-            var d = new float[n][];
-            var z = new float[n];
-            models.Embed(batch, Width, Height, s, d, z);
-            sig.AddRange(s);
-            dn.AddRange(d);
-            zero.AddRange(z);
-            batch.Clear();
-        }
-
-        static bool ReadFull(Stream s, byte[] buffer)
+        internal static bool ReadFull(Stream s, byte[] buffer)
         {
             int got = 0;
             while (got < buffer.Length)

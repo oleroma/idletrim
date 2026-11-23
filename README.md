@@ -5,25 +5,36 @@ the action, then compresses the result to fit a size cap (like Discord's 10 MB).
 grew out of [cap-compress](https://github.com/oleroma/cap-compress) and keeps all of
 its size controls.
 
-Action is found from the video alone with two local AI image models running on your
-GPU: no HUD positions, no game-specific setup, nothing sent online.
+It works as a light video editor straight away: opening a video runs no AI. When you
+want, **Detect action** finds the action with local AI image models from Hugging Face,
+running on your GPU: any size your hardware allows, no game-specific setup, nothing
+sent online.
 
 ## How it works
 
-1. **Drop a video.** IdleTrim decodes it at 10 fps and sends two frames a second to
-   both models. A 100 s 1440p60 replay takes about 25 s.
+1. **Drop a video.** One quick decode makes the timeline's thumbnails and a small
+   preview copy for playback; no AI. Everything starts kept: cut what you don't want by
+   hand, or let detection do it.
 2. **Look at the timeline.** It shows a film strip, an action graph with the
    threshold line, and a band with the kept parts in blue. Cut parts are dimmed.
 3. **Adjust.**
-   - **Detection**: SigLIP 2, DINOv2 or Both.
+   - **Prompt model** and **Visual model**: which local models detect action (see
+     below); either can be None. **Detect action** runs them over the video, two
+     frames a second, and keeps their results, so switching between models you've
+     run is instant.
    - **Sensitivity** moves the threshold; higher keeps more.
    - **Padding** keeps some time before each action, and 1.5x as much after.
    - **Drag across the band** to add a kept part. Dragging into a part next to it
      merges them into one. **Right-drag** cuts a range.
    - **Right-click a part** (or press Delete at the playhead) to remove it.
-   - **Drag a part's edge** to make it start or end elsewhere.
-   - **S** splits the part at the playhead, so each half can be removed on its own.
-     S on a split removes it, and dragging a new part over it joins the halves.
+   - **Drag a kept part** to move its nearer edge: grab it right of its middle to move
+     the right edge, left of its middle for the left edge. The edge moves exactly as
+     far as you drag, from wherever you grabbed it. A plain click just moves the
+     playhead.
+   - **Double-click a part** (or press **S** at the playhead) to split it there, so each
+     half can be removed on its own.
+     Doing it again on a split removes it, and dragging a new part over it joins the halves. Each
+     half's edges drag like any part's; dragging into the other half moves the split.
    - **I** and **O** mark a range; **K** keeps it, **X** cuts it, Esc clears the marks.
    - **Ctrl+Z** undoes, and **Reset edits** goes back to what detection chose.
    - Everything you change by hand stays as you set it when you move the sliders or
@@ -39,9 +50,15 @@ GPU: no HUD positions, no game-specific setup, nothing sent online.
    everything. Scrubbing or editing while playing carries on from there. A player
    warms up wherever the playhead rests, so Play starts at once, and Pause keeps it
    ready, so resuming is instant too. Clicking elsewhere while playing moves the
-   playhead at once and carries on from exactly there in about a second. Most of
-   that is decoding from the keyframe before the click, so a shorter keyframe
-   interval in OBS makes seeking faster.
+   playhead at once and carries on from exactly there in about a quarter of a
+   second.
+
+   Playback uses a small **preview copy** of the video (640x360, a keyframe every
+   half second, about 10–30 MB per 100 s), written during analysis from the same
+   decode. Seeking in it is quick and playing it takes little CPU, whatever the
+   original's bitrate or keyframe interval. Videos analysed before it existed get one
+   in the background, at low priority, the first time they're opened. Exports always
+   use the original.
 5. **Export.** The kept parts are joined in order and saved next to the original.
    - The **target size starts at max**: the source's own quality for the kept length,
      and it follows the kept length until you move it.
@@ -54,23 +71,43 @@ GPU: no HUD positions, no game-specific setup, nothing sent online.
      the GPU when it can) in the source's container.
    - The output is `name_idletrim` plus the extension.
 
-### The two models
+### The models
 
-- **SigLIP 2** (Google) understands text, so it works before any training: each frame
-  is compared with action prompts like "a gunfight with muzzle flash" and idle prompts
-  like "a game menu".
-- **DINOv2** (Meta) captures finer visual detail but has no text side. Until it has
-  learned from you, it learns from SigLIP: in each video, the frames SigLIP is surest
-  about teach DINOv2 what action and idle look like, and DINOv2 then judges every
-  frame by what's on screen. Camera movement on its own doesn't count as action.
+- **Prompt models, SigLIP 2** (Google) understand text, so they work before any
+  training: each frame is compared with action prompts like "a gunfight with muzzle
+  flash" and idle prompts like "a game menu".
+- **Visual models, DINOv2** (Meta) capture finer visual detail but have no text side.
+  Until one has learned from you, it learns from the prompt model: in each video, the
+  frames the prompt model is surest about teach it what action and idle look like, and
+  it then judges every frame by what's on screen. Camera movement on its own doesn't
+  count as action.
+
+Built in, sized for what your GPU can take (download sizes, half precision):
+
+| Model | Kind | Download | Notes |
+|---|---|---|---|
+| SigLIP 2 base, 224 px | prompt | 786 MB | fast, any GPU |
+| SigLIP 2 large, 384 px | prompt | 1.8 GB | sharper frames |
+| SigLIP 2 so400m, 384 px | prompt | 2.3 GB | best that runs well on 8 GB |
+| SigLIP 2 giant, 384 px | prompt | 3.8 GB | 8 GB or more, slow |
+| DINOv2 small | visual | 88 MB | fast, any GPU |
+| DINOv2 base | visual | 176 MB | |
+| DINOv2 large | visual | 612 MB | best that runs well on 8 GB |
+| DINOv2 giant | visual | 2.3 GB | 12 GB or more |
+
+**Add from Hugging Face...** in either list takes any repo id of an ONNX SigLIP or
+DINOv2 model (for example from [onnx-community](https://huggingface.co/onnx-community)).
+IdleTrim reads its input size and colour normalisation from the repo's own config, so
+new and bigger models work without an update. A model downloads the first time you
+Detect with it, after asking. Each model keeps its own results and learning.
 
 ### Your own prompts
 
 **Prompts** opens the two lists, one prompt per line: action to keep, idle to cut.
 Describe what's on screen, for example "an enemy player being eliminated in a
-shooter" or "a kill feed notification popping up". New prompts are read by SigLIP 2's
-text half (about 600 MB, downloaded the first time you add one) and apply at once to
-every video, with no re-analysis. **Built-in prompts** puts the originals back.
+shooter" or "a kill feed notification popping up". The prompt model reads new prompts
+with its text side (downloaded with it) and they apply at once to every video it has
+run on, with no re-detecting. **Built-in prompts** puts the originals back.
 
 ### Learning from your edits
 
@@ -88,7 +125,8 @@ edits back when you open it again. Opening another video asks first; tick **Don'
 ask again** to skip that (set `AskBeforeReplacing` back to `true` in `session.json`
 to bring it back).
 
-Analyses are cached, so opening the same video again is instant. Cache, learning,
+Indexes and each model's results are cached, so opening the same video again is
+instant. Analyses from older versions are converted on first use. Cache, learning,
 edits and the session live in `%LOCALAPPDATA%\IdleTrim`.
 
 ## First run
@@ -97,9 +135,8 @@ IdleTrim needs:
 
 - **ffmpeg**: found next to the app, on `PATH` or via winget, or downloaded on request
   (about 100 MB).
-- **The models**: downloaded on request from Hugging Face into a `models` folder next
-  to the app (SigLIP 2 vision 178 MB, DINOv2 small 85 MB). The SigLIP 2 text model
-  (about 600 MB) is fetched only if you add your own prompts.
+- **Models**: only for Detect action, downloaded on request from Hugging Face into a
+  `models` folder next to the app.
 - **The .NET 8 Desktop Runtime**.
 
 The models run on the GPU through DirectML, so any DirectX 12 GPU works; without one
@@ -127,7 +164,8 @@ build\bin\Tests\Release\net8.0-windows\Tests.exe <video> <out dir>
 
 Without arguments only the detection logic is tested. With a video they also cover
 the real analysis on the GPU, the cache, learning, exports (x264, NVENC, original
-format, stream copy), silent playback, and the window driven in-process.
+format, stream copy), silent playback, and the window driven in-process. Add
+`window` or `player` after the out dir to run only the window or playback tests.
 
 ## Tools
 

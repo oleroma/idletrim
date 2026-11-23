@@ -8,9 +8,9 @@ using System.Windows.Forms;
 
 namespace IdleTrim
 {
-    // Film strip, action graph and keep/cut band in one control. Click or drag the strip to scrub. On the band, drag to add a
-    // kept part (it merges with any part it touches), right-drag to cut, right-click a part to remove it, drag a part's edge
-    // to move it. S splits a part at the playhead, I and O mark a range for K (keep) or X (cut), Ctrl+Z undoes.
+    // Film strip, action graph and keep/cut band in one control. Click or drag the strip to scrub. On the band, drag from a cut
+    // area to add a kept part (it merges with any part it touches), drag a kept part to move its nearer edge, right-drag to
+    // cut, right-click a part to remove it, double-click a part to split it. S splits a part at the playhead, I and O mark a range for K (keep) or X (cut), Ctrl+Z undoes.
     class Timeline : Control
     {
         Analysis analysis;
@@ -20,10 +20,10 @@ namespace IdleTrim
         HashSet<int> splits = new HashSet<int>();
         double threshold, playhead;
         double markIn = double.NaN, markOut = double.NaN;
-        int dragEdge = -1;
+        int edgeStart = -1, edgeEnd, edgeFrom, edgeX;   // grabbing a kept part: its steps [start, end), the edge that moves, where the press was
+        bool edgeRight;
         double viewStart, viewLen;   // the part of the video on screen; viewLen 0 means all of it
         public const double MinView = 5;
-        bool dragLeftKept;
         int bandFrom = -1, bandX;     // a drag across the band: where it started
         bool bandKeep, bandMoved;
         readonly Dictionary<int, Bitmap> thumbs = new Dictionary<int, Bitmap>();
@@ -36,7 +36,7 @@ namespace IdleTrim
         public event Action PlayRequested;
         public event Action<int> SplitRequested;    // step index where the new part starts
         public event Action<int, int, bool> RangeRequested;   // first step, end step (exclusive), keep
-        public event Action<int, int, bool, bool> EdgeDragged;   // boundary step, step it moved to, whether the left side is kept, first move of the drag
+        public event Action<int, int, bool, int, bool> EdgeDragged;   // part's first step, end step (exclusive), right edge?, where that edge is now, first move
 
         public Timeline()
         {
@@ -98,22 +98,6 @@ namespace IdleTrim
 
         int StepEdge(double seconds) { return analysis == null ? 0 : Math.Max(0, Math.Min(analysis.Count, (int)Math.Round(seconds / Analysis.Step))); }
 
-        // Where a kept part starts or ends, within a few pixels of x; -1 if none.
-        int EdgeNear(int x)
-        {
-            if (keep == null || keep.Length == 0) return -1;
-            int best = -1;
-            float bestDist = Theme.S(6) + 0.5f;
-            for (int b = 0; b <= keep.Length; b++)
-            {
-                bool edge = b == 0 ? keep[0] : b == keep.Length ? keep[b - 1] : keep[b - 1] != keep[b];
-                if (!edge) continue;
-                float d = Math.Abs(X(analysis.TimeOf(b)) - x);
-                if (d < bestDist) { bestDist = d; best = b; }
-            }
-            return best;
-        }
-
         // ---- view: Ctrl+wheel zooms around the pointer, the wheel scrolls ----
 
         public double ViewStart { get { return viewStart; } }
@@ -163,24 +147,36 @@ namespace IdleTrim
         float X(double seconds) { return analysis == null ? 0 : (float)((seconds - viewStart) / ViewLength * (Width - 1)); }
         double TimeAt(int x) { return analysis == null ? 0 : Math.Max(0, Math.Min(analysis.Duration, viewStart + (double)x / Math.Max(1, Width - 1) * ViewLength)); }
 
+        // Repaints at once: Windows only paints when no input is waiting, so while the mouse keeps moving an ordinary
+        // Invalidate would leave the playhead trailing behind the pointer. Drawing a step takes a few ms.
         void Scrub(double seconds)
         {
             Playhead = seconds;
             if (PlayheadChanged != null) PlayheadChanged(this, EventArgs.Empty);
+            Update();
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
         {
             Focus();
+            // Keep the mouse for the whole drag, so moves and the release still arrive once the pointer leaves the strip,
+            // e.g. past its left end to reach the very start.
+            if (UseCapture) Capture = true;
             if (analysis == null || (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right)) return;
             if (e.Y >= BandTop - Gap && keep != null)
             {
-                int edge = e.Button == MouseButtons.Left ? EdgeNear(e.X) : -1;
-                if (edge >= 0)
+                int at = analysis.StepAt(TimeAt(e.X));
+                if (e.Button == MouseButtons.Left && keep[at])
                 {
-                    dragEdge = edge;
-                    dragLeftKept = edge > 0 ? keep[edge - 1] : !keep[0];
-                    if (EdgeDragged != null) EdgeDragged(edge, edge, dragLeftKept, true);
+                    // Pressed on a kept part: the edge on that side of its middle follows the drag, by exactly as much as the pointer moves.
+                    int a, b;
+                    Scoring.RunAt(keep, at, splits, out a, out b);
+                    edgeStart = a;
+                    edgeEnd = b + 1;
+                    edgeRight = TimeAt(e.X) >= analysis.TimeOf(a) + (edgeEnd - a) * Analysis.Step / 2;
+                    edgeFrom = edgeRight ? edgeEnd : edgeStart;
+                    edgeX = e.X;
+                    bandMoved = false;
                     return;
                 }
                 bandFrom = analysis.StepAt(TimeAt(e.X));
@@ -197,8 +193,18 @@ namespace IdleTrim
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
+            // A drag only goes on while its button is held; if the release was missed somewhere, end it here.
+            if ((scrubbing || edgeStart >= 0 || bandFrom >= 0) && (e.Button & (MouseButtons.Left | MouseButtons.Right)) == 0) EndDrag();
             if (scrubbing) Scrub(TimeAt(e.X));
-            else if (dragEdge >= 0) { if (EdgeDragged != null) EdgeDragged(dragEdge, StepEdge(TimeAt(e.X)), dragLeftKept, false); }
+            else if (edgeStart >= 0)
+            {
+                if (!bandMoved && Math.Abs(e.X - edgeX) < Theme.S(4)) return;
+                double moved = (double)(e.X - edgeX) / Math.Max(1, Width - 1) * ViewLength;
+                int to = edgeFrom + (int)Math.Round(moved / Analysis.Step);
+                to = edgeRight ? Math.Max(edgeStart + 1, Math.Min(analysis.Count, to)) : Math.Max(0, Math.Min(edgeEnd - 1, to));
+                if (EdgeDragged != null) EdgeDragged(edgeStart, edgeEnd, edgeRight, to, !bandMoved);
+                bandMoved = true;
+            }
             else if (bandFrom >= 0)
             {
                 if (!bandMoved && Math.Abs(e.X - bandX) < Theme.S(4)) return;
@@ -206,8 +212,33 @@ namespace IdleTrim
                 if (RangeDragged != null) RangeDragged(Math.Min(bandFrom, to), Math.Max(bandFrom, to) + 1, bandKeep, !bandMoved);
                 bandMoved = true;
             }
-            else if (analysis != null) Cursor = e.Y >= BandTop - Gap ? (EdgeNear(e.X) >= 0 ? Cursors.SizeWE : Cursors.Default) : Cursors.Default;
             base.OnMouseMove(e);
+        }
+
+        // Tests drive the control without a real mouse and must not take the real one.
+        internal static bool UseCapture = true;
+
+        void EndDrag()
+        {
+            bandFrom = -1;
+            edgeStart = -1;
+            scrubbing = false;
+            if (UseCapture) Capture = false;
+        }
+
+        // Losing the mouse to another window (Alt+Tab, a dialog) ends the drag where it is.
+        protected override void OnMouseCaptureChanged(EventArgs e)
+        {
+            if (UseCapture && !Capture) { bandFrom = -1; edgeStart = -1; scrubbing = false; }
+            base.OnMouseCaptureChanged(e);
+        }
+
+        // Double-click on the band: split the part there (or remove the split if there is one).
+        protected override void OnMouseDoubleClick(MouseEventArgs e)
+        {
+            if (analysis != null && keep != null && e.Button == MouseButtons.Left && e.Y >= BandTop - Gap && SplitRequested != null)
+                SplitRequested(StepEdge(TimeAt(e.X)));
+            base.OnMouseDoubleClick(e);
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
@@ -218,9 +249,8 @@ namespace IdleTrim
                 if (bandKeep) Scrub(TimeAt(e.X));
                 else if (RemoveRequested != null) RemoveRequested(bandFrom);
             }
-            bandFrom = -1;
-            scrubbing = false;
-            dragEdge = -1;
+            if (edgeStart >= 0 && !bandMoved) Scrub(TimeAt(e.X));
+            EndDrag();
             base.OnMouseUp(e);
         }
         protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
