@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Builds IdleTrim and prints "build-file: <path> <version>", as the pipeline expects.
+# The app is idletrim.exe plus the ONNX Runtime, DirectML and NAudio DLLs (framework-dependent:
+# it needs the .NET 8 Desktop Runtime), so the build file is one zip of that folder. No models:
+# the app downloads them when asked. A Windows app, so it builds only on Windows.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+# The version is 0.1.<build number>. agent-build pc and fallback.yml set BUILD_NUMBER.
+n="${BUILD_NUMBER:?Set by agent-build pc and fallback.yml from .agents/build-number}"
+version="0.1.$n"
+[ "${OS:-}" = Windows_NT ] || { echo "IdleTrim builds only on Windows." >&2; exit 1; }
+
+out=build/publish
+rm -rf "$out"
+dotnet publish IdleTrim.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=false \
+  -p:Version="$version" -p:InformationalVersion="$version-$(git rev-parse --short=7 HEAD)" \
+  -p:IncludeSourceRevisionInInformationalVersion=false -o "$out" -nologo -v q
+rm -f "$out"/*.pdb "$out"/DirectML.Debug.dll "$out"/onnxruntime.lib
+
+zip="build/idletrim-$version.zip"
+rm -f build/idletrim-*.zip
+powershell.exe -NoProfile -NonInteractive -Command \
+  "Compress-Archive -Path '$(cygpath -w "$out")\\*' -DestinationPath '$(cygpath -w "$zip")' -Force" </dev/null
+echo "build-file: $zip $version"

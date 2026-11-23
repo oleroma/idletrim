@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Installs the built IdleTrim for the user at %LOCALAPPDATA%\Programs\IdleTrim and adds it to the
+# Start menu. Never starts, stops or restarts IdleTrim. IdleTrim can't update itself while it
+# runs, so when it's running the build isn't installed and the note says to close it and run
+# agent-install again. Models the app downloaded into its models folder are kept.
+# Usage: install <version>-<commit> <path to idletrim-<version>.zip>
+set -euo pipefail
+build_id="$1"
+zip="$2"
+[ "${OS:-}" = Windows_NT ] && [ -n "${LOCALAPPDATA:-}" ] ||
+  { echo "note: Not installed: not on Windows."; exit 0; }
+dest="$(cygpath -u "$LOCALAPPDATA")/Programs/IdleTrim"
+export APP_EXE_W
+APP_EXE_W="$(cygpath -w "$dest/idletrim.exe")"
+mkdir -p "$dest"
+
+# One whose path can't be read (an elevated one) counts as running, so its files are left alone.
+if powershell.exe -NoProfile -NonInteractive -Command '$p = @(Get-Process -Name idletrim -ErrorAction SilentlyContinue | Where-Object { -not $_.Path -or $_.Path -eq $env:APP_EXE_W }); if ($p.Count -gt 0) { exit 0 } else { exit 1 }' </dev/null; then
+  echo "note: Not installed: IdleTrim is running. Close it, then run agent-install $build_id."
+  exit 0
+fi
+
+# Unpacked beside the install first, so a failed unpack leaves the old build working.
+tmp="$dest.new"
+rm -rf "$tmp"
+powershell.exe -NoProfile -NonInteractive -Command \
+  "Expand-Archive -Path '$(cygpath -w "$zip")' -DestinationPath '$(cygpath -w "$tmp")' -Force" </dev/null
+cp -rf "$tmp"/. "$dest"/
+rm -rf "$tmp"
+
+lnk="$(cygpath -w "$APPDATA")\\Microsoft\\Windows\\Start Menu\\Programs\\IdleTrim.lnk"
+powershell.exe -NoProfile -NonInteractive -Command "\$s = (New-Object -ComObject WScript.Shell).CreateShortcut('$lnk'); \$s.TargetPath = \$env:APP_EXE_W; \$s.WorkingDirectory = '$(cygpath -w "$dest")'; \$s.Description = 'IdleTrim'; \$s.Save()" </dev/null \
+  || echo "note: Couldn't create the Start menu shortcut."
+echo "note: IdleTrim $build_id installed; it runs the next time it starts. Path: $LOCALAPPDATA\\Programs\\IdleTrim."

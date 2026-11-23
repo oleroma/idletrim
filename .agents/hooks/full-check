@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Full checks, run once per feature before the merge by agent-check (on the PC, or the fallback
+# with checks), not by builds. The quick tests already ran in the builds, so they aren't repeated.
+# - Everywhere: the app and the tests build with warnings as errors.
+# - On the PC, when IDLETRIM_TEST_VIDEO names a gameplay recording and IDLETRIM_MODELS the models
+#   folder: the full background test run on that video (analysis, learning, exports, window,
+#   playback; several minutes). Its output and data stay in build/full-check.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+[ "${OS:-}" = Windows_NT ] || { echo "IdleTrim's checks run only on Windows." >&2; exit 1; }
+dotnet build IdleTrim.csproj -c Release -warnaserror -nologo -v q
+dotnet build tests/Tests.csproj -c Release -warnaserror -nologo -v q
+if [ -n "${IDLETRIM_TEST_VIDEO:-}" ] && [ -n "${IDLETRIM_MODELS:-}" ]; then
+  build/bin/Tests/Release/net8.0-windows/Tests.exe "$IDLETRIM_TEST_VIDEO" "$(cygpath -w build/full-check)"
+else
+  echo "No IDLETRIM_TEST_VIDEO or IDLETRIM_MODELS: skipped the test run on a real video."
+fi
