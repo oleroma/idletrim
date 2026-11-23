@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Step 1: make the feature branch and open a draft PR into main. Any edits already made on main
+# become the branch's first commit, with the latest main merged in.
+# Usage: .agents/agent-start [--continue] <feature-name>   (run it again after resolving conflicts)
+#   --continue  skip the check for other agents' draft PRs (the task isn't a feature, or Olex said to go on)
+source "$(dirname "$0")/lib.sh"
+cd "$WORKTREE"
+
+skip_check=0
+if [ "${1:-}" = "--continue" ]; then
+  skip_check=1
+  shift
+fi
+name="${1:-}"
+[ -n "$name" ] || die "Usage: agent-start [--continue] <feature-name>"
+git check-ref-format --branch "$name" >/dev/null || die "\"$name\" isn't a valid branch name."
+case "$name" in
+  main) die "Pick a feature name, not $name." ;;
+esac
+
+git fetch origin --prune
+current="$(git symbolic-ref --quiet --short HEAD)" || die "Not on a branch."
+
+# publish: pushes the branch and opens its draft PR.
+publish() {
+  git push -u origin "$name"
+  local url
+  url="$(gh api -X POST "repos/$SLUG/pulls" -f base=main -f head="$name" -f title="$name" \
+    -f body="Work in progress by an agent." -F draft=true --jq .html_url)"
+  finish done "Branch $name made, with main at $(git rev-parse --short origin/main) merged in." "Draft PR: $url"
+}
+
+# A run after resolving conflicts from merging main into the new branch.
+if [ "$current" = "$name" ]; then
+  git ls-remote --exit-code origin "refs/heads/$name" >/dev/null && die "$name is already pushed: this is its feature branch."
+  if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
+    mapfile -t files < <(git diff --name-only --diff-filter=U)
+    left="$(conflict_markers "${files[@]}")"
+    [ -z "$left" ] || finish conflicts "Conflict markers are still in:" "$left" "Resolve them, then run agent-start $name again."
+    stage_all
+    git commit --no-edit
+  fi
+  publish
+fi
+
+case "$current" in
+  main) ;;
+  *) die "On $current, another feature branch. Start a feature from main." ;;
+esac
+
+if [ "$skip_check" = 0 ]; then
+  drafts="$(gh api "repos/$SLUG/pulls?base=main&state=open&per_page=100" \
+    --jq '.[] | select(.draft) | "#\(.number) \(.head.ref) \(.html_url)"')"
+  if [ -n "$drafts" ]; then
+    finish other-agent "Another feature holds the repo. Open draft PRs into main:" "$drafts" \
+      "If this task isn't a feature, run agent-start --continue $name." \
+      "Otherwise make no branch: ask Olex whether to wait for it to merge or to send this task to that feature's thread."
+  fi
+fi
+
+if git show-ref --verify --quiet "refs/heads/$name" ||
+  git ls-remote --exit-code origin "refs/heads/$name" >/dev/null; then
+  die "A branch named $name already exists. Pick another name."
+fi
+
+# The branch starts where the agent worked, with its edits, if any, as the first commit.
+# GitHub won't open a PR without a commit, so with no edits it starts with an empty one.
+git switch --no-track -c "$name"
+stage_all
+if [ -n "$(git diff --cached --name-only)" ]; then
+  git commit -m "Start $name"
+else
+  git commit --allow-empty -m "Start $name"
+fi
+
+if ! git merge --no-edit origin/main; then
+  mapfile -t files < <(git diff --name-only --diff-filter=U)
+  finish conflicts "Merging the latest main into $name conflicts in:" "${files[@]}" \
+    "Resolve them, then run agent-start $name again."
+fi
+publish

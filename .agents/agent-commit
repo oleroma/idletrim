@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Step 2: commit all changes with the agent's message and push.
+# Usage: .agents/agent-commit "<message>"
+source "$(dirname "$0")/lib.sh"
+cd "$WORKTREE"
+require_feature_branch
+
+message="${1:-}"
+[ -n "$message" ] || die "Usage: agent-commit \"<message>\""
+
+stage_all
+staged="$(git diff --cached --name-only)"
+
+if [ -z "$staged" ]; then
+  committed="Nothing new to commit."
+else
+  git commit -m "$message"
+  committed="Committed $(git rev-parse --short HEAD)."
+fi
+git push origin "$BRANCH"
+if [ -n "$staged" ]; then status "✏️ ${message%%$'\n'*}"; fi
+
+finish done "$committed Pushed $BRANCH."

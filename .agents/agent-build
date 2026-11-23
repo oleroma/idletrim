@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# Step 3: build the feature branch. A PC build posts its result on the feature's PR when it ends,
+# so the thread agent watching that PR wakes up. It runs agent-install on the build; a failed
+# install is reported in the summary but doesn't fail the build. Every PC build publishes its
+# build files as a pre-release on its build/<n> tag, as the CI fallback does, so Obtainium on the
+# phone can install it; once the build is installed, that upload runs in the background
+# (upload-build). Builds don't run the full checks: agent-check runs them once, before the merge.
+# Before it builds, it stops with "other-build" when the repo's newest build came from another
+# branch whose PR is still open, since Olex may still be testing that build; --replace builds anyway.
+# It also stops with "workflow-change" when everything the branch changed since main is pipeline
+# files or documentation: Olex tests those himself. Only Olex passes --force to build anyway.
+# Usage:
+#   .agents/agent-build pc <branch> [--replace] [--force]   on the PC, in D:\dev\<repo>: builds <branch> in build/src
+#   .agents/agent-build ci <branch> [--replace] [--force]   in the cloud: checks out <branch>, builds it in CI
+# Without <branch> it builds what's checked out where it runs.
+source "$(dirname "$0")/lib.sh"
+cd "$WORKTREE"
+
+HOOKS="$WORKTREE/.agents/hooks"
+
+# ci_build_release <sha>: prints "<n> <version>" for the newest pre-release of <sha> that CI
+# built (the commit's ci-build status), or nothing. The release is on the build/<n> tag and its title is the version.
+ci_build_release() {
+  local n version
+  [ -n "$(gh api "repos/$SLUG/commits/$1/statuses?per_page=100" --jq '.[]
+    | select(.state == "success")
+    | select(.context == "ci-build") | .id' | head -n 1)" ] || return 0
+  while read -r n; do
+    [ -n "$n" ] || continue
+    version="$(gh api "repos/$SLUG/releases/tags/build/$n" --jq 'select((.assets | length) > 0) | .name' 2>/dev/null || true)"
+    if [[ "$version" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+      echo "$n $version"
+      return 0
+    fi
+  done < <(git ls-remote --tags origin 'refs/tags/build/*' | sed -nE "s#^$1\s+refs/tags/build/([0-9]+)\$#\1#p" | sort -rn)
+}
+
+# fetch_ci_build <n> <dir>: downloads the build/<n> pre-release's files into <dir> and sets
+# files and names as a build on the PC would.
+fetch_ci_build() {
+  local n="$1" dir="$2" name
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  gh release download "build/$n" -R "$SLUG" -D "$dir" || die "Couldn't download the files of build/$n."
+  while IFS= read -r name; do
+    files+=("$dir/$name")
+    names+=("$name")
+  done < <(ls -1 "$dir")
+  [ "${#files[@]}" -gt 0 ] || die "The build/$n pre-release has no files."
+}
+
+# contains <old> <new>: true when commit <old> is in <new>'s history, asked on GitHub.
+contains() {
+  case "$(gh api "repos/$SLUG/compare/$1...$2" --jq .status)" in
+    ahead | identical) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# guard_other_build <sha>: stops with other-build when the newest build/<n> tag is on a commit
+# that <sha> doesn't contain and main doesn't contain, but an open PR's branch does: that's
+# another feature's build, which Olex may still be testing. Builds of the same branch, and
+# builds after the other PR merged or closed, go ahead.
+guard_other_build() {
+  [ "$REPLACE" = 0 ] || return 0
+  local last n sha pr head ref
+  last="$(git ls-remote --tags origin 'refs/tags/build/*' | sed -nE 's#^([0-9a-f]+)\s+refs/tags/build/([0-9]+)$#\2 \1#p' | sort -n | tail -n 1)"
+  [ -n "$last" ] || return 0
+  n="${last%% *}"
+  sha="${last#* }"
+  if contains "$sha" "$1" || contains "$sha" main; then return 0; fi
+  while read -r pr head ref; do
+    [ -n "$pr" ] || continue
+    if contains "$sha" "$head"; then
+      finish other-build "The newest build, build/$n, came from $ref (PR #$pr: https://github.com/$SLUG/pull/$pr), which is still open." \
+        "Olex may still be testing it; this build would replace it on the phone. Not built." \
+        "Ask Olex. If he says to go on, run agent-build again with --replace."
+    fi
+  done < <(gh api "repos/$SLUG/pulls?state=open&per_page=100" --jq '.[] | "\(.number) \(.head.sha) \(.head.ref)"')
+}
+
+# guard_workflow_change: stops with workflow-change when the whole branch changed only pipeline
+# files or documentation since main (lib.sh only_pipeline_changes). A build wouldn't test them.
+guard_workflow_change() {
+  [ "$FORCE" = 0 ] || return 0
+  only_pipeline_changes || return 0
+  mapfile -t files <<<"$CHANGES"
+  finish workflow-change "Not built: $(git rev-parse --short=7 HEAD) changed only pipeline files or documentation since main:" "${files[@]}" \
+    "Olex tests these himself. Tell him in the thread what changed and how to test it; don't run it." \
+    "agent-merge accepts this branch without a new build."
+}
+
+# open_build_window: opens a Git Bash window in front on the PC that shows this build's log and the
+# build hook's output live
+# (.agents/build-window). Nothing happens where there's no Git Bash.
+open_build_window() {
+  [ -f /git-bash.exe ] && command -v cygpath >/dev/null 2>&1 || return 0
+  cmd //c start "" "$(cygpath -w /git-bash.exe)" -c \
+    "bash '$(cygpath -m "$AGENTS_DIR/build-window")' '$(cygpath -m "$LOG_FILE")' '$(cygpath -m "$CANCEL_FILE")' '$(cygpath -m "$BUILD_DIR/logs/build-output.txt")' $$" ||
+    echo "Couldn't open the build window."
+}
+
+# watch_cancel: runs in the background during a PC build. When Olex cancels in the build window,
+# it ends this script (its TERM trap exits once the running step stops) and kills the running
+# steps with everything they started, so the result is "cancelled".
+watch_cancel() {
+  set +x
+  local me=$BASHPID
+  while [ ! -f "$CANCEL_FILE" ]; do sleep 1; done
+  kill -TERM $$ 2>/dev/null || true
+  stop_children $$ "$me"
+}
+
+# stop_children <pid> <pid to skip>: kills the child processes of <pid> and their trees,
+# Windows programs (Gradle, cargo) included. Cygwin's ps may put a status letter before the PID.
+stop_children() {
+  local pid winpid
+  ps | awk -v p="$1" -v s="$2" 'NR > 1 { o = ($1 ~ /^[0-9]+$/) ? 0 : 1
+      if ($(2 + o) == p && $(1 + o) != s) print $(1 + o), $(4 + o) }' |
+    while read -r pid winpid; do
+      stop_children "$pid" "$2"
+      taskkill //F //T //PID "$winpid" >/dev/null 2>&1 || kill -9 "$pid" 2>/dev/null || true
+    done
+}
+
+# installed_emoji: where a build was installed, for its ready line: 📲 the phone when it has an
+# APK, else 🪟 Windows.
+installed_emoji() {
+  local name
+  for name in "${names[@]}"; do
+    case "$name" in *.apk) echo 📲; return 0 ;; esac
+  done
+  echo 🪟
+}
+
+build_pc() {
+  report() { report_pr "PC build" "$@"; }
+  [ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
+
+  take_lock "$(git rev-parse --short=7 HEAD)"
+  # The commit is read once: everything below builds, publishes and reports this one.
+  SHA="$(git rev-parse HEAD)"
+  # The build window shows this log; Ctrl+C there makes the cancel file, and watch_cancel stops
+  # the build. The file stays until the next build, so the result can still see it.
+  CANCEL_FILE="$BUILD_DIR/.build-cancel"
+  local out_file="$BUILD_DIR/logs/build-output.txt"
+  rm -f "$CANCEL_FILE" "$out_file"
+  open_build_window
+  trap 'exit 130' TERM
+  watch_cancel &
+  local watcher=$!
+  cleanup() { kill "$watcher" 2>/dev/null || true; release_lock; }
+
+  local commit
+  commit="$(git rev-parse --short=7 HEAD)"
+  guard_workflow_change
+  guard_other_build "$SHA"
+
+  # An Android repo: say at once whether the phone is on adb, so Olex can connect it while this
+  # builds. The install runs after the build, so a phone connected by then still gets it.
+  local what
+  what="$(what_emoji)"
+  warn_unbuilt "$SHA"
+  if [[ "$what" != *🤖* ]]; then
+    status "🔨🖥️$what Building on the PC."
+  elif command -v adb >/dev/null 2>&1 && [ "$(adb devices | awk -F'\t' 'NR > 1 && $2 == "device"' | wc -l)" -gt 0 ]; then
+    status "🔨🖥️$what Building on the PC, installing to the phone."
+  else
+    status "🔨🖥️$what Building on the PC. Phone is offline: connect it before the build ends to have it installed."
+  fi
+
+  # When CI already built this commit (agent-build ci while the PC was away), download and
+  # install that build instead of building it again.
+  local version="" line rel v files=() names=() ci_tag="" built_here=1
+  read -r ci_tag version < <(ci_build_release "$SHA") || true
+  if [ -n "$ci_tag" ]; then
+    built_here=0
+    fetch_ci_build "$ci_tag" "$BUILD_DIR/logs/ci-build"
+  else
+    if [ -f "$HOOKS/quick-test" ]; then
+      bash "$HOOKS/quick-test" || { status "❌$what Quick tests failed at $commit."; finish checks-failed "Quick tests failed at $commit (see the log). Not built."; }
+    fi
+
+    # The repo's next build number, claimed on GitHub; the build hook makes the version from it.
+    BUILD_NUMBER="$(bash "$AGENTS_DIR/build-number")" || die "Couldn't get a build number from GitHub. Not built."
+    export BUILD_NUMBER
+
+    if ! bash "$HOOKS/build" >"$out_file"; then
+      cat "$out_file"
+      status "❌$what Build failed at $commit."
+      finish checks-failed "Build failed at $commit (see the log)."
+    fi
+    cat "$out_file"
+
+    # The hook prints one "build-file: <path> <version>" line per build file.
+    while IFS= read -r line; do
+      case "$line" in
+        "build-file: "*)
+          line="${line#build-file: }"
+          rel="${line% *}"
+          v="${line##* }"
+          [ -n "$rel" ] && [ "$rel" != "$line" ] || die "Bad build-file line from the build hook: $line"
+          [ -f "$WORKTREE/$rel" ] || die "Build file not found: $rel"
+          files+=("$WORKTREE/$rel")
+          names+=("$(basename "$rel")")
+          if [ -z "$version" ]; then version="$v"; fi
+          ;;
+      esac
+    done <"$out_file"
+    [ "${#files[@]}" -gt 0 ] || die "The build hook printed no \"build-file: <path> <version>\" line."
+  fi
+
+  # One folder per build, and the newest build files directly in build/.
+  local dest="$BUILD_DIR/builds/$version-$commit" old
+  mkdir -p "$dest"
+  cp "${files[@]}" "$dest/"
+  # builds/.newest lists the build files last copied to build/, removed before the new ones come.
+  if [ -f "$BUILD_DIR/builds/.newest" ]; then
+    while IFS= read -r old; do
+      if [ -n "$old" ]; then rm -f "$BUILD_DIR/$old"; fi
+    done <"$BUILD_DIR/builds/.newest"
+  fi
+  cp "${files[@]}" "$BUILD_DIR/"
+  printf '%s\n' "${names[@]}" >"$BUILD_DIR/builds/.newest"
+  echo "$version-$commit" >"$BUILD_DIR/builds/.newest-build"
+
+  # Keep the last 4 builds, plus the newest build of each part (and the newest one on main) that
+  # they don't have, so agent-install still finds a part that hasn't been rebuilt for a while.
+  # A part is a file name without its build's version. Old-style build folders may hold a
+  # worktree; prune forgets those.
+  local seen=" " seen_main=" " i=0 d dv dc f p keep
+  git fetch -q origin main || true
+  while read -r d; do
+    d="${d%/}"
+    i=$((i + 1))
+    dv="$(basename "$d")"
+    dc="${dv##*-}"
+    dv="${dv%-*}"
+    keep=0
+    if [ "$i" -le 4 ]; then keep=1; fi
+    for f in "$d"/*; do
+      [ -f "$f" ] || continue
+      p="$(basename "$f")"
+      p="${p//"$dv"/}"
+      case "$seen" in *" $p "*) ;; *) keep=1 seen+="$p " ;; esac
+      if git merge-base --is-ancestor "$dc" origin/main 2>/dev/null; then
+        case "$seen_main" in *" $p "*) ;; *) keep=1 seen_main+="$p " ;; esac
+      fi
+    done
+    if [ "$keep" = 0 ]; then rm -rf "$d"; fi
+  done < <(ls -1dt "$BUILD_DIR"/builds/*/)
+  git -C "$MAIN_REPO" worktree prune
+
+  local summary=("Built $version-$commit:") name
+  if [ "$built_here" = 0 ]; then summary=("Downloaded $version-$commit from its CI pre-release (https://github.com/$SLUG/releases/tag/build/$ci_tag), not built again:"); fi
+  for name in "${names[@]}"; do summary+=("File: $BUILD_DIR/$name"); done
+
+  # Install it. agent-install prints its own result and summary; keep the summary lines.
+  # A failed install doesn't fail the build: it was built; the summary
+  # says why the phone didn't get it; the build is published below either way.
+  local out away=() installed=1
+  out="$(bash "$AGENTS_DIR/agent-install" "$version-$commit")" || installed=0
+  while IFS= read -r line; do
+    case "$line" in
+      "result: "* | "status: "* | "Installed build "* | "Install of build "*) ;;
+      "log: "*) if [ "$installed" = 0 ]; then summary+=("Install log: ${line#log: }"); fi ;;
+      "phone-away: "*) away+=("${line#phone-away: }") ;;
+      *) summary+=("$line") ;;
+    esac
+  done <<<"$out"
+  echo "$out"
+
+  # Every build is published right after the install, as the CI fallback does (upload-build).
+  # Once it's installed, the upload runs in the background, so the build ends right after the
+  # install. When it wasn't installed, the phone gets it from the pre-release, so this waits.
+  # The upload takes the copies in builds/, which the next build doesn't change.
+  if [ "$built_here" = 1 ]; then
+    local url="https://github.com/$SLUG/releases/tag/build/$BUILD_NUMBER"
+    local up=("$AGENTS_DIR/upload-build" "$SHA" "$BUILD_NUMBER" "$version"
+      "$(bash "$AGENTS_DIR/release-notes" "$SHA" "$BUILD_NUMBER" "PC build of $SHA")")
+    for name in "${names[@]}"; do up+=("$dest/$name"); done
+    if [ "$installed" = 1 ] && [ "${#away[@]}" = 0 ]; then
+      UPLOAD_BACKGROUND=1 nohup bash "${up[@]}" </dev/null >/dev/null 2>&1 3>&- &
+      disown
+      summary+=("Publishing in the background: $url" "A failed upload is posted on the PR; its log is $BUILD_DIR/logs/upload-build-*.log.")
+      status "$(installed_emoji)📦 Build $BUILD_NUMBER installed, publishing: [build $BUILD_NUMBER]($url)"
+    elif bash "${up[@]}" >/dev/null; then
+      summary+=("Published: $url")
+      status "📦 Build $BUILD_NUMBER published, not installed: [build $BUILD_NUMBER]($url)"
+    else
+      summary+=("Publishing the build failed (see $BUILD_DIR/logs/upload-build-*.log).")
+      status "❌ Build $BUILD_NUMBER built but not published (see the log)."
+    fi
+  else
+    summary+=("CI already published this build.")
+    if [ "$installed" = 1 ] && [ "${#away[@]}" = 0 ]; then
+      status "$(installed_emoji) Build $ci_tag installed from CI: [build $ci_tag](https://github.com/$SLUG/releases/tag/build/$ci_tag)"
+    else
+      status "📦 Build $ci_tag not installed; it's published: [build $ci_tag](https://github.com/$SLUG/releases/tag/build/$ci_tag)"
+    fi
+  fi
+  if [ "${#away[@]}" -gt 0 ]; then summary+=("Not installed on the phone (the reason is above); it can get the build from the pre-release."); fi
+  # The full checks aren't run here: agent-check runs them once, before the merge.
+  if [ "$built_here" = 1 ]; then summary+=("Full checks: before the merge (agent-check)."); fi
+
+  finish done "${summary[@]}"
+}
+
+build_ci() {
+  require_feature_branch
+  git fetch origin "$BRANCH"
+  [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ] ||
+    die "HEAD isn't what's pushed on origin/$BRANCH. Run agent-commit first."
+  guard_workflow_change
+  guard_other_build "$(git rev-parse HEAD)"
+  warn_unbuilt "$(git rev-parse HEAD)"
+
+  # The run does what a PC build does: quick tests, build, publish. run_fallback shows the
+  # release links as soon as the build is published. The full checks run before the merge.
+  if ! run_fallback; then
+    status "❌$(what_emoji) CI build failed: [CI run]($RUN_URL)"
+    failed="$(failed_steps "$RUN" | paste -sd ';' -)"
+    finish checks-failed "The CI build failed: $RUN_URL" "Failed: ${failed:-(see the run)}" \
+      "The cause is in that job's step log in the CI run."
+  fi
+  local n summary=("Built in CI: $RUN_URL" "Full checks: before the merge (agent-check).")
+  n="$(newest_build_tag "$(git rev-parse HEAD)")"
+  [ -n "$n" ] || die "The fallback run passed but no build/<n> tag is on this commit: $RUN_URL"
+  mapfile -t -O "${#summary[@]}" summary < <(release_lines "$n")
+
+  finish done "${summary[@]}"
+}
+
+USAGE="Usage: agent-build pc|ci <branch> [--replace] [--force]"
+REPLACE=0
+FORCE=0
+BRANCH=""
+FLAGS=()
+MODE="${1:-}"
+shift || true
+for arg in "$@"; do
+  case "$arg" in
+    --replace) REPLACE=1; FLAGS+=("$arg") ;;
+    --force) FORCE=1; FLAGS+=("$arg") ;;
+    -*) die "$USAGE" ;;
+    *) [ -z "$BRANCH" ] || die "$USAGE"; BRANCH="$arg" ;;
+  esac
+done
+
+# With a branch, first bring the build checkout to that branch, then build there: on the PC
+# that's the build/src worktree (made the first time), in the cloud the branch itself.
+if [ -n "$BRANCH" ]; then
+  git fetch origin "$BRANCH" || die "Couldn't fetch $BRANCH."
+  case "$MODE" in
+    pc)
+      checkout_src "$BRANCH"
+      exec bash "$MAIN_REPO/build/src/.agents/agent-build" pc "${FLAGS[@]}" >&3 2>&3 3>&-
+      ;;
+    ci)
+      git checkout "$BRANCH" && git merge --ff-only "origin/$BRANCH" || die "Couldn't check out $BRANCH."
+      exec bash "$WORKTREE/.agents/agent-build" ci "${FLAGS[@]}" >&3 2>&3 3>&-
+      ;;
+  esac
+fi
+
+case "$MODE" in
+  pc) build_pc ;;
+  ci) build_ci ;;
+  *) die "$USAGE" ;;
+esac

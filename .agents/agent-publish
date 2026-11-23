@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Publishes main as it is now, when Olex asks: builds main's newest commit in CI with every part
+# (fallback.yml; main changed no part since main, so every part is built), publishes it as a
+# pre-release on its build/<n> tag, then starts prune.yml, whose update-latest step puts its files
+# on the "latest" release. Works from a cloud session; the PC isn't needed.
+# Usage: .agents/agent-publish   (with main checked out at origin/main)
+source "$(dirname "$0")/lib.sh"
+cd "$WORKTREE"
+
+git fetch -q origin main
+[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] ||
+  die "Check out main at origin/main first (git checkout main && git pull --ff-only)."
+BRANCH=main
+sha="$(git rev-parse HEAD)"
+
+if ! run_fallback; then
+  status "❌$(what_emoji) Publishing main failed in CI: [CI run]($RUN_URL)"
+  failed="$(failed_steps "$RUN" | paste -sd ';' -)"
+  finish failed "The CI build of main failed: $RUN_URL" "Failed: ${failed:-(see the run)}"
+fi
+n="$(newest_build_tag "$sha")"
+[ -n "$n" ] || die "The CI run passed but no build/<n> tag is on main's commit: $RUN_URL"
+gh workflow run prune.yml -R "$SLUG" --ref main ||
+  die "Published build $n, but couldn't start prune.yml to update the latest release."
+url="https://github.com/$SLUG/releases/tag/latest"
+status "📦 Main published as build $n with every part; the [latest release]($url) updates in a minute."
+finish done "Published main as build $n: https://github.com/$SLUG/releases/tag/build/$n" \
+  "prune.yml is updating the latest release: $url"
