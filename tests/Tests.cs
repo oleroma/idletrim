@@ -31,6 +31,7 @@ namespace IdleTrim
             CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
             // The app runs with invariant globalization, so decimal commas can't reach ffmpeg.
             Detection();
+            MomentsLogic();
             if (args.Length >= 3 && args[2] == "player")
             {
                 string ff = Engine.FindTool("ffmpeg");
@@ -98,6 +99,29 @@ namespace IdleTrim
             Check(Scoring.Segments(new bool[0], 0).Count == 0, "empty video has no parts");
         }
 
+        // Moments: made-up embeddings where four moments look alike and the rest is varied gameplay.
+        static void MomentsLogic()
+        {
+            var rnd = new Random(7);
+            Func<float[]> noise = () => Enumerable.Range(0, 64).Select(_ => (float)(rnd.NextDouble() * 2 - 1)).ToArray();
+            var look = noise();
+            var f = new float[200][];
+            var truth = new[] { 20, 60, 61, 110, 170 };
+            for (int i = 0; i < f.Length; i++)
+            {
+                var v = noise();
+                if (truth.Contains(i)) for (int j = 0; j < v.Length; j++) v[j] = look[j] * 3 + v[j] * 0.6f;
+                f[i] = Models.Normalise(v);
+            }
+            var p = MomentFinder.Score(f, new List<int> { 20 });
+            var ev = MomentFinder.Events(p);
+            Console.WriteLine("moments found from one example: " + string.Join(", ", ev));
+            Check(ev.Contains(20) && ev.Count(e => e == 60 || e == 61) == 1 && ev.Contains(110) && ev.Contains(170), "one example finds the moments like it, a run of two as one");
+            Check(ev.Count == 4, "and nothing else: " + ev.Count + " found");
+            Check(MomentFinder.Score(f, new List<int>()) == null && MomentFinder.Score(null, new List<int> { 3 }) == null, "no examples or no crops: no scores");
+            Check(MomentFinder.Events(Series(0, 0.9f, 0.2f, 0.95f, 0, 0, 0, 0.8f)).SequenceEqual(new[] { 3, 7 }), "moments under a second apart count as one, at their peak");
+        }
+
         static void RealVideo(string path, string outDir)
         {
             string ffmpeg = Engine.FindTool("ffmpeg"), ffprobe = Engine.FindTool("ffprobe");
@@ -160,6 +184,31 @@ namespace IdleTrim
 
             var back = Analysis.Load(a.Key);
             Check(back != null && back.Count == a.Count && back.FeaturesOf(sigBase.Id)[5].SequenceEqual(sf[5]) && back.FeaturesOf(dinoSmall.Id)[9].SequenceEqual(df[9]) && back.Previews[7].SequenceEqual(a.Previews[7]), "cache round trip with each model's features");
+
+            // Moments: the region's crops from the full-size original, scored against a marked example.
+            {
+                var m = new Moments { X = 0.3, Y = 0.15, W = 0.4, H = 0.2 };
+                m.Examples.Add(a.Count / 3);
+                m.Save(a.Key);
+                var mb = Moments.Load(a.Key);
+                Check(mb.RegionId == m.RegionId && mb.Examples.SequenceEqual(m.Examples), "moments round trip");
+                sw.Restart();
+                var cf = Crops.Run(ffmpeg, a, path, m, dinoSmall, (x, t) => { }, new CancelFlag());
+                took = sw.Elapsed.TotalSeconds;
+                Console.WriteLine(string.Format("region crops from the original in {0:0.0}s ({1:0.0}x real time)", took, v.Duration / took));
+                Check(cf.Length == a.Count && cf.All(e => Math.Abs(Models.Dot(e, e) - 1) < 1e-3), "a unit crop embedding per step");
+                var cb = Crops.Load(a, m, dinoSmall.Id);
+                Check(cb != null && cb[7].SequenceEqual(cf[7]), "crops cache round trip");
+                Check(Crops.Load(a, new Moments { X = 0.1, Y = 0.1, W = 0.2, H = 0.2 }, dinoSmall.Id) == null, "another region doesn't use those crops");
+                double sameStep = Models.Dot(cf[10], df[10]);
+                Console.WriteLine(string.Format("crop vs whole frame similarity at 5 s: {0:0.00}", sameStep));
+                Check(sameStep < 0.98, "the crop is not the whole frame");
+                var mp = MomentFinder.Score(cf, m.Examples);
+                var found = MomentFinder.Events(mp);
+                Console.WriteLine("moments like the frame at " + (a.Count / 3 * Analysis.Step) + "s: " + string.Join(", ", found.Select(x => (x * Analysis.Step).ToString("0.0") + "s")));
+                Check(mp[a.Count / 3] >= MomentFinder.Threshold && found.Count < a.Count / 4, "the example scores as a moment and most steps don't");
+                File.Delete(Path.Combine(Analysis.DataDir, "moments", a.Key + ".json"));
+            }
 
             // An untrained visual model learns from the prompt model's surest frames: it agrees with it, not with motion.
             var dl = Scoring.VisualFromPrompts(a, dinoSmall.Id, zs);
@@ -759,6 +808,51 @@ namespace IdleTrim
                     Check(worst < 60, string.Format("scrubbing{0} doesn't stall the window ({1:0}ms)", whilePlaying ? " while playing" : "", worst));
                     if (whilePlaying) Call("StopPlayback");
                 }
+            }
+
+            // Moments in the window: draw a region on the preview, mark examples with M, Find, jump with N.
+            {
+                var pv = Get<Preview>("preview");
+                var down = typeof(Control).GetMethod("OnMouseDown", BindingFlags.NonPublic | BindingFlags.Instance);
+                var move = typeof(Control).GetMethod("OnMouseMove", BindingFlags.NonPublic | BindingFlags.Instance);
+                var up = typeof(Control).GetMethod("OnMouseUp", BindingFlags.NonPublic | BindingFlags.Instance);
+                var keyDown = typeof(Control).GetMethod("OnKeyDown", BindingFlags.NonPublic | BindingFlags.Instance);
+                File.Delete(Path.Combine(Analysis.DataDir, "moments", a.Key + ".json"));   // left by an earlier window run
+                Call("LoadMoments");
+                Check(!Get<Btn>("findButton").Enabled, "Find waits for a region and an example");
+                Call("DrawRegion");
+                Check(pv.Drawing, "Region starts drawing on the preview");
+                int pw = pv.Width, ph = pw * 9 / 16;
+                if (ph > pv.Height) { ph = pv.Height; pw = ph * 16 / 9; }
+                int bx = (pv.Width - pw) / 2, by = (pv.Height - ph) / 2;
+                down.Invoke(pv, new object[] { new MouseEventArgs(MouseButtons.Left, 1, bx + pw * 3 / 10, by + ph / 10, 0) });
+                move.Invoke(pv, new object[] { new MouseEventArgs(MouseButtons.Left, 0, bx + pw / 2, by + ph / 5, 0) });
+                up.Invoke(pv, new object[] { new MouseEventArgs(MouseButtons.Left, 1, bx + pw * 7 / 10, by + ph * 3 / 10, 0) });
+                var mo = Get<Moments>("moments");
+                Console.WriteLine(string.Format("region drawn: {0}", mo.RegionId));
+                Check(!pv.Drawing && Math.Abs(mo.X - 0.3) < 0.01 && Math.Abs(mo.W - 0.4) < 0.01 && Math.Abs(mo.Y - 0.1) < 0.01 && Math.Abs(mo.H - 0.2) < 0.01, "dragging on the preview draws the region");
+                int ex = a.Count / 2;
+                timeline.Playhead = a.TimeOf(ex);
+                keyDown.Invoke(timeline, new object[] { new KeyEventArgs(Keys.M) });
+                Check(mo.Examples.SequenceEqual(new[] { ex }) && pv.MomentText == "EXAMPLE", "M marks the playhead as an example");
+                Shot(outDir, "3-moments-marked");
+                Check(Get<Btn>("findButton").Enabled, "Find is ready");
+                var swm = Stopwatch.StartNew();
+                Call("FindMoments");
+                for (int i = 0; i < 1200 && (Get<bool>("busy") || Get<float[]>("momentScores") == null); i++) await Task.Delay(100);
+                var fm = Get<List<int>>("found");
+                Console.WriteLine(string.Format("window Find: {0:0.0}s, {1} / {2}", swm.Elapsed.TotalSeconds, Get<Label>("status").Text, Get<Label>("momentsInfo").Text));
+                Check(Get<float[]>("momentScores") != null && fm.Contains(ex), "Find finds the example again");
+                Shot(outDir, "4-moments-found");
+                timeline.Playhead = 0;
+                keyDown.Invoke(timeline, new object[] { new KeyEventArgs(Keys.N) });
+                Check(Math.Abs(timeline.Playhead - a.TimeOf(fm[0])) < 1e-6, "N jumps to the first moment");
+                var reopened = Moments.Load(a.Key);
+                Check(reopened.Examples.SequenceEqual(new[] { ex }) && reopened.RegionId == mo.RegionId, "the region and examples are saved with the video");
+                Call("ToggleExample", ex + 1);
+                Check(mo.Examples.Count == 0 && Get<float[]>("momentScores") == null, "M next to an example unmarks it");
+                Call("ToggleExample", ex);
+                Check(Get<float[]>("momentScores") != null, "marking again scores from the cached crops, no new pass");
             }
 
             // Your own prompts: a new one is read by the text model, the scores change, built-in ones come back.

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -11,6 +12,7 @@ namespace IdleTrim
     // Film strip, action graph and keep/cut band in one control. Click or drag the strip to scrub. On the band, drag from a cut
     // area to add a kept part (it merges with any part it touches), drag a kept part to move its nearer edge, right-drag to
     // cut, right-click a part to remove it, double-click a part to split it. S splits a part at the playhead, I and O mark a range for K (keep) or X (cut), Ctrl+Z undoes.
+    // M marks the step under the playhead as an example of a moment to find; N jumps to the next moment found (Shift+N back).
     class Timeline : Control
     {
         Analysis analysis;
@@ -37,6 +39,19 @@ namespace IdleTrim
         public event Action<int> SplitRequested;    // step index where the new part starts
         public event Action<int, int, bool> RangeRequested;   // first step, end step (exclusive), keep
         public event Action<int, int, bool, int, bool> EdgeDragged;   // part's first step, end step (exclusive), right edge?, where that edge is now, first move
+        public event Action<int> ExampleToggled;    // M: the step under the playhead is an example of a moment, or no longer one
+
+        // Moments: your examples, the moments found, and the score they come from (any may be null).
+        List<int> examples, found;
+        float[] momentScores;
+
+        public void SetMoments(List<int> examples, List<int> found, float[] scores)
+        {
+            this.examples = examples;
+            this.found = found;
+            momentScores = scores;
+            Invalidate();
+        }
 
         public Timeline()
         {
@@ -311,6 +326,18 @@ namespace IdleTrim
                 case Keys.S:
                     if (SplitRequested != null) SplitRequested(StepEdge(playhead));
                     break;
+                case Keys.M:
+                    if (ExampleToggled != null) ExampleToggled(analysis.StepAt(playhead));
+                    break;
+                case Keys.N:
+                    // Next found moment; Shift+N the one before.
+                    if (found != null && found.Count > 0)
+                    {
+                        int here = analysis.StepAt(playhead);
+                        int to = e.Shift ? found.Where(f => f < here).DefaultIfEmpty(-1).Max() : found.Where(f => f > here).DefaultIfEmpty(-1).Min();
+                        if (to >= 0) Scrub(analysis.TimeOf(to));
+                    }
+                    break;
                 case Keys.I: markIn = playhead; Invalidate(); break;
                 case Keys.O: markOut = playhead; Invalidate(); break;
                 case Keys.Escape: ClearMarks(); break;
@@ -411,6 +438,38 @@ namespace IdleTrim
                     g.DrawLine(dash, 0, ty, w, ty);
             }
 
+            // Moments: their score as a thin line, a tick at each one found, a diamond at each example.
+            if (momentScores != null && momentScores.Length > 1)
+            {
+                float top = StripH + Gap + 3, h = GraphH - 6;
+                int i0 = Math.Max(0, analysis.StepAt(viewStart) - 1), i1 = Math.Min(momentScores.Length - 1, analysis.StepAt(viewStart + ViewLength) + 1);
+                var pts = new PointF[Math.Max(2, i1 - i0 + 1)];
+                for (int i = 0; i < pts.Length; i++)
+                {
+                    int j = Math.Min(momentScores.Length - 1, i0 + i);
+                    pts[i] = new PointF(X(analysis.TimeOf(j) + Analysis.Step / 2), top + h - momentScores[j] * h);
+                }
+                using (var line = new Pen(Color.FromArgb(200, Theme.Moment), 1.2f))
+                    g.DrawLines(line, pts);
+            }
+            if (found != null)
+                using (var pen = new Pen(Theme.Moment, Theme.S(2)))
+                    foreach (int f in found)
+                    {
+                        float fx = X(analysis.TimeOf(f) + Analysis.Step / 2);
+                        g.DrawLine(pen, fx, StripH + Gap, fx, StripH + Gap + Theme.S(10));
+                    }
+            if (examples != null)
+                using (var fill = new SolidBrush(Theme.Moment))
+                using (var edge = new Pen(Theme.Bg, 1))
+                    foreach (int ex in examples)
+                    {
+                        float ex0 = X(analysis.TimeOf(ex) + Analysis.Step / 2), ey = StripH - Theme.S(2), r = Theme.S(5);
+                        var diamond = new[] { new PointF(ex0, ey - r), new PointF(ex0 + r, ey), new PointF(ex0, ey + r), new PointF(ex0 - r, ey) };
+                        g.FillPolygon(fill, diamond);
+                        g.DrawPolygon(edge, diamond);
+                    }
+
             // Marked range.
             if (!double.IsNaN(markIn) || !double.IsNaN(markOut))
             {
@@ -473,19 +532,89 @@ namespace IdleTrim
         }
     }
 
-    // The frame under the playhead, with a kept/cut badge.
+    // The frame under the playhead, with a kept/cut badge. Shows the moments region, and in drawing mode a drag draws it.
     class Preview : Control
     {
         Image image;
         Bitmap live;   // reused for playback frames
         bool playing;
         int shownStep = -1;
-        public string Badge, Caption;
+        public string Badge, Caption, MomentText;
         public bool Kept;
+        public RectangleF LookRegion;   // fractions of the frame; empty: none
+        bool drawing;
+        PointF dragFrom = new PointF(float.NaN, float.NaN), dragTo;
+        public event Action<RectangleF> RegionDrawn;
+
+        // Drawing mode: the next drag over the frame draws the region. Esc or SetDrawing(false) leaves it.
+        public bool Drawing { get { return drawing; } }
+        public void SetDrawing(bool on)
+        {
+            drawing = on;
+            dragFrom = new PointF(float.NaN, float.NaN);
+            Cursor = on ? Cursors.Cross : Cursors.Default;
+            if (on) Focus();
+            Invalidate();
+        }
+
+        Rectangle Box()
+        {
+            int w = Width, h = w * 9 / 16;
+            if (h > Height) { h = Height; w = h * 16 / 9; }
+            return new Rectangle((Width - w) / 2, (Height - h) / 2, w, h);
+        }
+
+        PointF FractionAt(int x, int y)
+        {
+            var box = Box();
+            return new PointF(Math.Max(0, Math.Min(1, (x - box.X) / (float)Math.Max(1, box.Width))), Math.Max(0, Math.Min(1, (y - box.Y) / (float)Math.Max(1, box.Height))));
+        }
+
+        static RectangleF Span(PointF a, PointF b)
+        {
+            return RectangleF.FromLTRB(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Max(a.X, b.X), Math.Max(a.Y, b.Y));
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (drawing && e.Button == MouseButtons.Left) { dragFrom = dragTo = FractionAt(e.X, e.Y); Invalidate(); }
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            if (drawing && !float.IsNaN(dragFrom.X)) { dragTo = FractionAt(e.X, e.Y); Invalidate(); }
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            if (drawing && !float.IsNaN(dragFrom.X))
+            {
+                dragTo = FractionAt(e.X, e.Y);
+                var r = Span(dragFrom, dragTo);
+                dragFrom = new PointF(float.NaN, float.NaN);
+                if (r.Width >= 0.02f && r.Height >= 0.02f)   // a click, or a sliver, draws nothing
+                {
+                    SetDrawing(false);
+                    if (RegionDrawn != null) RegionDrawn(r);
+                }
+                Invalidate();
+            }
+            base.OnMouseUp(e);
+        }
+
+        protected override bool IsInputKey(Keys k) { return (k & Keys.KeyCode) == Keys.Escape || base.IsInputKey(k); }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Escape && drawing) SetDrawing(false);
+            base.OnKeyDown(e);
+        }
 
         public Preview()
         {
-            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
         }
 
         // A playback frame: packed BGR, w x h.
@@ -529,10 +658,7 @@ namespace IdleTrim
             g.Clear(BackColor);
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.InterpolationMode = InterpolationMode.HighQualityBilinear;
-            // Largest 16:9 box that fits.
-            int w = Width, h = w * 9 / 16;
-            if (h > Height) { h = Height; w = h * 16 / 9; }
-            var box = new Rectangle((Width - w) / 2, (Height - h) / 2, w, h);
+            var box = Box();   // the largest 16:9 box that fits
             using (var path = Theme.Round(box, Theme.S(8)))
             {
                 using (var b = new SolidBrush(Theme.Surface)) g.FillPath(b, path);
@@ -561,6 +687,30 @@ namespace IdleTrim
                 var r = new RectangleF(box.Right - size.Width - Theme.S(24), box.Y + Theme.S(10), size.Width + Theme.S(14), size.Height + Theme.S(6));
                 Theme.Fill(g, Color.FromArgb(190, Theme.Bg), r, Theme.S(5));
                 Theme.Draw(g, Caption, Font, Theme.Text, Rectangle.Round(r), TextFormatFlags.HorizontalCenter);
+            }
+            if (MomentText != null)
+            {
+                var size = TextRenderer.MeasureText(MomentText, Font);
+                var r = new RectangleF(box.X + Theme.S(10), box.Bottom - size.Height - Theme.S(16), size.Width + Theme.S(14), size.Height + Theme.S(6));
+                Theme.Fill(g, Theme.Moment, r, Theme.S(5));
+                Theme.Draw(g, MomentText, Font, Theme.Bg, Rectangle.Round(r), TextFormatFlags.HorizontalCenter);
+            }
+
+            // The moments region, or the one being drawn.
+            var shownRegion = drawing && !float.IsNaN(dragFrom.X) ? Span(dragFrom, dragTo) : LookRegion;
+            if (shownRegion.Width > 0 && shownRegion.Height > 0)
+            {
+                var rr = new RectangleF(box.X + shownRegion.X * box.Width, box.Y + shownRegion.Y * box.Height, shownRegion.Width * box.Width, shownRegion.Height * box.Height);
+                using (var pen = new Pen(Theme.Moment, Theme.S(2)) { DashStyle = drawing ? DashStyle.Dash : DashStyle.Solid })
+                    g.DrawRectangle(pen, rr.X, rr.Y, rr.Width, rr.Height);
+            }
+            if (drawing)
+            {
+                string tip = "Drag over the frame to mark where to look · Esc cancels";
+                var size = TextRenderer.MeasureText(tip, Font);
+                var r = new RectangleF(box.X + (box.Width - size.Width) / 2f - Theme.S(7), box.Bottom - size.Height - Theme.S(16), size.Width + Theme.S(14), size.Height + Theme.S(6));
+                Theme.Fill(g, Color.FromArgb(210, Theme.Bg), r, Theme.S(5));
+                Theme.Draw(g, tip, Font, Theme.Text, Rectangle.Round(r), TextFormatFlags.HorizontalCenter);
             }
         }
 

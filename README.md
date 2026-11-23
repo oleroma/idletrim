@@ -109,6 +109,21 @@ shooter" or "a kill feed notification popping up". The prompt model reads new pr
 with its text side (downloaded with it) and they apply at once to every video it has
 run on, with no re-detecting. **Built-in prompts** puts the originals back.
 
+### Find moments like these
+
+To find every moment like one you point at, for example THE FINALS' "Eliminated"
+text: press **Region** and drag over the preview where it shows on screen, then put
+the playhead on a frame where it's there and press **M** (or **Mark**). Mark a few if
+they look different. **Find** looks at that part of every half second of the original
+video, at full size, with the visual model (or the prompt model if there's no visual
+one), and learns your examples against the rest of the video. Found moments get an
+orange tick on the timeline, examples an orange diamond, and the thin orange line is
+how alike each moment looks. **N** jumps to the next one, Shift+N back. M next to an
+example unmarks it. The region and examples are saved with the video; marking more
+rescores at once, a new region or model looks again.
+
+For now this only finds the moments; it doesn't change what's kept yet.
+
 ### Learning from your edits
 
 With **Learn from my edits** on, every export saves the final keep/cut choice with the

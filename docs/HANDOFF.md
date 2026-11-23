@@ -34,9 +34,14 @@ action, then compresses to a size cap. It's a derivative of
   target size starts at max.
 - **Icon**: rotated 90° and orange compared with cap-compress.
 
-## Next: universal "find moments like these" detector
+## In progress: universal "find moments like these" detector
 
-Agreed with the user, not started:
+Stage 1 (branch `moments-detector`, PR #1): Region drawn on the preview, examples marked
+with M, Find embeds full-res crops of the region (decoded from the original, CUDA →
+D3D11 → CPU) with the visual model, and `MomentFinder` trains a head on the examples
+against steps clearly unlike them. Found moments show on the timeline; N jumps. Code in
+`src/Moments.cs`. Next is step 3 below (walk back to the fight start, keep it). The
+original plan, agreed with the user:
 
 1. The user marks a few example moments in a video, for example THE FINALS'
    **"Eliminated"** text, and can draw the **screen region** to look in.

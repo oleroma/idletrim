@@ -18,6 +18,7 @@ namespace IdleTrim
         public static readonly Color Faint = Color.FromArgb(92, 96, 110);
         public static readonly Color Accent = Color.FromArgb(104, 130, 255);
         public static readonly Color AccentHover = Color.FromArgb(128, 151, 255);
+        public static readonly Color Moment = Color.FromArgb(255, 160, 60);   // found moments and their examples (orange, like the icon)
 
         static float scale;
         public static int S(int x)
