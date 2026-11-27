@@ -41,6 +41,13 @@ namespace IdleTrim
         readonly Btn forget = new Btn("Forget learning");
         readonly Btn promptsButton = new Btn("Prompts");
         readonly Btn resetEdits = new Btn("Reset edits") { Enabled = false };
+        readonly Btn regionButton = new Btn("Region"), markButton = new Btn("Mark (M)"), findButton = new Btn("Find");
+        readonly Label momentsInfo = Text0();
+        Moments moments;            // this video's region and examples
+        float[][] crops;            // the region's embedding at every step, for momentsModel
+        string momentsModel;
+        float[] momentScores;
+        List<int> found = new List<int>();
         readonly Stack<Tuple<sbyte[], HashSet<int>>> undo = new Stack<Tuple<sbyte[], HashSet<int>>>();
         HashSet<int> splitBase;
         readonly Session session = Session.Load();
@@ -215,6 +222,11 @@ namespace IdleTrim
             timeline.SplitRequested += Split;
             timeline.RangeRequested += SetRange;
             timeline.EdgeDragged += DragEdge;
+            timeline.ExampleToggled += ToggleExample;
+            preview.RegionDrawn += SetRegion;
+            regionButton.Click += (o, e) => DrawRegion();
+            markButton.Click += (o, e) => { if (analysis != null) ToggleExample(analysis.StepAt(timeline.Playhead)); timeline.Focus(); };
+            findButton.Click += (o, e) => FindMoments();
             play.Click += (o, e) => { PlayPause(); timeline.Focus(); };
             playAll.CheckedChanged += (o, e) => { RestartPlayback(); ScheduleWarm(); };
             playTimer.Tick += (o, e) => PlayTick();
@@ -400,15 +412,33 @@ namespace IdleTrim
             p.Controls.Add(row, 0, 7);
             p.SetColumnSpan(row, 3);
 
+            // Find moments like these: a region, a few examples, Find.
+            var moRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, S(8), 0, 0), WrapContents = false };
+            var moLabel = Dim("Moments");
+            moLabel.Margin = new Padding(0, S(6), S(8), 0);
+            moRow.Controls.Add(moLabel);
+            regionButton.Margin = markButton.Margin = new Padding(0, 0, S(8), 0);
+            findButton.Margin = new Padding(0);
+            moRow.Controls.Add(regionButton);
+            moRow.Controls.Add(markButton);
+            moRow.Controls.Add(findButton);
+            p.Controls.Add(moRow, 0, 8);
+            p.SetColumnSpan(moRow, 3);
+            momentsInfo.ForeColor = Theme.Dim;
+            momentsInfo.MaximumSize = new Size(S(360), 0);
+            momentsInfo.Margin = new Padding(0, S(2), 0, 0);
+            p.Controls.Add(momentsInfo, 0, 9);
+            p.SetColumnSpan(momentsInfo, 3);
+
             keptInfo.Font = new Font("Segoe UI Semibold", 10f);
             keptInfo.Margin = new Padding(0, S(8), 0, 0);
             keptInfo.MaximumSize = new Size(S(360), 0);
-            p.Controls.Add(keptInfo, 0, 8);
+            p.Controls.Add(keptInfo, 0, 10);
             p.SetColumnSpan(keptInfo, 3);
 
-            for (int i = 0; i < 9; i++) p.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            for (int i = 0; i < 11; i++) p.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             p.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            p.RowCount = 10;
+            p.RowCount = 12;
             return p;
         }
 
@@ -668,6 +698,7 @@ namespace IdleTrim
             }
             if (kind == ModelKind.Prompts) lastPrompt = PromptModel; else lastVisual = VisualModel;
             Rescore();
+            LoadMoments();   // the crops are per model
         }
 
         // Adds a model by its Hugging Face repo id (a SigLIP or DINOv2 model in ONNX form).
@@ -878,7 +909,11 @@ namespace IdleTrim
             timeline.SetAnalysis(a);
             proxyReady = a != null && Proxy.Ready(a.Key);
             if (a != null && !proxyReady) StartProxy();
+            moments = null;   // the old video's moments go before anything draws with the new one
+            momentScores = null;
+            found = new List<int>();
             Rescore();
+            LoadMoments();
             if (a != null && restore != null)
             {
                 timeline.Playhead = Math.Min(restore.Playhead, a.Duration);
@@ -939,6 +974,130 @@ namespace IdleTrim
             else if (chosen.Any(m => analysis.FeaturesOf(m.Id) == null)) detectInfo.Text = "Not detected yet: everything is kept until you Detect or cut it.";
             else if (scores == null) detectInfo.Text = embeddingPrompts ? "Reading the prompts..." : "Detected; choose a prompt model or teach the visual one.";
             else detectInfo.Text = "Detected with " + string.Join(" + ", chosen.Select(m => m.Name.Split(',')[0])) + ".";
+        }
+
+        // ---- moments: find more of what you marked ----
+
+        // The model that looks at the region: the visual model, or the prompt model when there's no visual one.
+        ModelInfo MomentsModel { get { return Catalog.Find(VisualModel) ?? Catalog.Find(PromptModel); } }
+
+        void LoadMoments()
+        {
+            moments = analysis == null ? null : Moments.Load(analysis.Key);
+            crops = null;
+            momentsModel = null;
+            preview.SetDrawing(false);
+            if (moments != null)
+            {
+                var m = MomentsModel;
+                if (m != null && (crops = Crops.Load(analysis, moments, m.Id)) != null) momentsModel = m.Id;
+            }
+            ScoreMoments();
+        }
+
+        void SaveMoments()
+        {
+            if (analysis == null || moments == null) return;
+            try { moments.Save(analysis.Key); } catch (Exception) { }
+        }
+
+        void ScoreMoments()
+        {
+            momentScores = moments == null ? null : MomentFinder.Score(crops, moments.Examples);
+            found = MomentFinder.Events(momentScores);
+            UpdateMoments();
+        }
+
+        void UpdateMoments()
+        {
+            preview.LookRegion = moments != null && moments.HasRegion ? new RectangleF((float)moments.X, (float)moments.Y, (float)moments.W, (float)moments.H) : RectangleF.Empty;
+            timeline.SetMoments(moments == null ? null : moments.Examples, found, momentScores);
+            int n = moments == null ? 0 : moments.Examples.Count;
+            if (moments == null) momentsInfo.Text = "";
+            else if (!moments.HasRegion) momentsInfo.Text = "Find more moments like one you mark: draw a Region where it shows on screen, then mark it.";
+            else if (n == 0) momentsInfo.Text = "Put the playhead where it shows and press M to mark an example.";
+            else if (momentScores == null) momentsInfo.Text = string.Format("{0} example{1} marked. Find looks for more.", n, n == 1 ? "" : "s");
+            else momentsInfo.Text = string.Format("Found {0} moment{1} like your {2} example{3}. N jumps to the next.", found.Count, found.Count == 1 ? "" : "s", n, n == 1 ? "" : "s");
+            if (analysis != null && (!playing || player == null)) ShowPlayhead();
+            SetInputs();
+        }
+
+        string MomentTextAt(int step)
+        {
+            if (moments == null) return null;
+            if (moments.Examples.Contains(step)) return "EXAMPLE";
+            if (momentScores != null && momentScores[step] >= MomentFinder.Threshold) return string.Format("MOMENT {0:0}%", momentScores[step] * 100);
+            return null;
+        }
+
+        void DrawRegion()
+        {
+            if (analysis == null) return;
+            StopPlayback();
+            preview.SetDrawing(!preview.Drawing);
+        }
+
+        // A new region: the old crops no longer apply, so Find runs again.
+        void SetRegion(RectangleF r)
+        {
+            if (moments == null) return;
+            moments.X = r.X;
+            moments.Y = r.Y;
+            moments.W = r.Width;
+            moments.H = r.Height;
+            SaveMoments();
+            crops = null;
+            momentsModel = null;
+            ScoreMoments();
+            timeline.Focus();
+        }
+
+        // M: the step is an example, or no longer one. Unmarking also takes the example next to it, so a slightly late M still finds it.
+        void ToggleExample(int step)
+        {
+            if (moments == null) return;
+            int near = moments.Examples.FindIndex(e => Math.Abs(e - step) <= 1);
+            if (near >= 0) moments.Examples.RemoveAt(near);
+            else { moments.Examples.Add(step); moments.Examples.Sort(); }
+            SaveMoments();
+            ScoreMoments();
+        }
+
+        // Embeds the region at every step from the full-size original (cached per region and model), then scores.
+        void FindMoments()
+        {
+            if (busy || analysis == null || moments == null || !moments.HasRegion || moments.Examples.Count == 0) return;
+            var model = MomentsModel;
+            if (model == null) { status.Text = "Choose a visual or prompt model to look with."; return; }
+            if (momentsModel == model.Id && crops != null) { ScoreMoments(); return; }
+            if (!model.Present())
+            {
+                if (!ConfirmDownload(new List<ModelInfo> { model })) { status.Text = "The model is needed to find moments."; return; }
+                RunBusy("Downloading", (flag, report) => model.Download((pct, name) => report(pct / 100.0, "Downloading " + name), flag), error =>
+                {
+                    progress.Value = 0;
+                    FillModels(promptPick, ModelKind.Prompts, PromptModel);
+                    FillModels(visualPick, ModelKind.Visual, VisualModel);
+                    if (error != null) { status.Text = "Couldn't download the model: " + error; return; }
+                    FindMoments();
+                });
+                return;
+            }
+            StopPlayback();
+            var a = analysis;
+            var m = moments;
+            float[][] result = null;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            RunBusy("Looking for moments", (flag, report) => { result = Crops.Run(ffmpeg, a, video.Path, m, model, report, flag); }, error =>
+            {
+                progress.Value = 0;
+                if (error != null) { status.Text = "Couldn't look for moments: " + error.Replace('\n', ' '); return; }
+                if (analysis != a || moments != m) return;
+                crops = result;
+                momentsModel = model.Id;
+                ScoreMoments();
+                status.Text = string.Format("Looked at the region with {0} in {1:0}s: {2} moment{3} found.", model.Name, sw.Elapsed.TotalSeconds, found.Count, found.Count == 1 ? "" : "s");
+            });
         }
 
         // ---- editing; every change can be undone with Ctrl+Z ----
@@ -1250,11 +1409,12 @@ namespace IdleTrim
 
         void ShowPlayhead()
         {
-            if (analysis == null) { preview.Badge = preview.Caption = null; preview.Kept = true; preview.Show(null, -1); return; }
+            if (analysis == null) { preview.Badge = preview.Caption = preview.MomentText = null; preview.Kept = true; preview.Show(null, -1); return; }
             int step = analysis.StepAt(timeline.Playhead);
             preview.Kept = keep == null || keep[step];
             preview.Badge = keep == null ? null : keep[step] ? "KEPT" : "CUT";
             preview.Caption = string.Format("{0} / {1}", Time(timeline.Playhead), Time(analysis.Duration));
+            preview.MomentText = MomentTextAt(step);
             preview.Show(analysis, step);
         }
 
@@ -1349,6 +1509,8 @@ namespace IdleTrim
             forget.Enabled = !busy && learner != null && learner.Videos > 0;
             promptsButton.Enabled = !busy;
             resetEdits.Enabled = ready && overrides != null && (overrides.Any(o => o != 0) || splits.Count > 0);
+            regionButton.Enabled = markButton.Enabled = ready;
+            findButton.Enabled = ready && moments != null && moments.HasRegion && moments.Examples.Count > 0 && MomentsModel != null;
             target.Enabled = canExport && plan.CanReduce;
             copy.Enabled = canExport && targetAtMax;
             autoRes.Enabled = encode;
